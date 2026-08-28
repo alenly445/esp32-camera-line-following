@@ -145,9 +145,9 @@ const uint32_t ULTRASONIC_TIMEOUT_US  = 30000;
 const uint16_t OBSTACLE_BRAKE_MS      = 800;
 const uint16_t OBSTACLE_MIN_SIDE_MS   = 200;
 const uint16_t OBSTACLE_CLEAR_EXTRA_LEFT_MS = 0;   // 清空后无需额外续移（实测调整）
-const int OBSTACLE_LATERAL_A_SPEED    = 35;
-const int OBSTACLE_LATERAL_B_SPEED    = 57;
-const int OBSTACLE_LATERAL_D_SPEED    = 35;
+const int OBSTACLE_LATERAL_A_SPEED    = 36;
+const int OBSTACLE_LATERAL_B_SPEED    = 62;
+const int OBSTACLE_LATERAL_D_SPEED    = 36;
 // 左移实测的编码器绝对计数比例，作为横移三轮目标比例。
 // 右移使用相同绝对比例，但三个轮子的计数方向全部取反。
 const int32_t LATERAL_RATIO_A_COUNTS = 220;
@@ -160,7 +160,7 @@ const int LATERAL_MIN_SPEED    = 35; // 防止霍尔修正把A/D压入实测无�
 // [v21] A/D独立基础速度：先同值，按实测修正均值标定后分开
 const int OBSTACLE_FORWARD_A_SPEED     = 66;
 const int OBSTACLE_FORWARD_D_SPEED     = 34;
-const int32_t OBSTACLE_FORWARD_TARGET_COUNTS = 420;
+const int32_t OBSTACLE_FORWARD_TARGET_COUNTS = 450;
 // [v24] 直行超时兜底：正常走完约0.3~1秒，3秒还没到说明编码器失效，强制结束
 const uint32_t OBSTACLE_FORWARD_TIMEOUT_MS = 1000;
 // A/D累计计数同步：领先侧降速、落后侧提速，减少越障直行偏航。
@@ -170,9 +170,9 @@ const int OBSTACLE_FORWARD_SYNC_MAX     = 14;
 // [v21] 修正下限：不许把落后轮压进实测起步死区（最低A/D PWM约33）
 const int OBSTACLE_FORWARD_MIN_A        = 38;
 const int OBSTACLE_FORWARD_MIN_D        = 38;
-const int OBSTACLE_RIGHT_A_SPEED       = 34;
-const int OBSTACLE_RIGHT_B_SPEED       = 49;
-const int OBSTACLE_RIGHT_D_SPEED       = 34;
+const int OBSTACLE_RIGHT_A_SPEED       = 35;
+const int OBSTACLE_RIGHT_B_SPEED       = 50;
+const int OBSTACLE_RIGHT_D_SPEED       = 35;
 const uint16_t OBSTACLE_MIN_RIGHT_MS   = 200;
 const uint8_t OBSTACLE_LINE_CONFIRM_COUNT = 3;
 const uint16_t OBSTACLE_COOLDOWN_MS    = 1000;
