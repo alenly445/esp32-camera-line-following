@@ -1,0 +1,23 @@
+{
+    "folders": [
+        {
+            "name": "esp32_car_vision",
+            "path": "esp32_car_vision"
+        }
+    ],
+    "settings": {
+        "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
+        "C_Cpp.default.compilerPath": "C:/Users/fengyh/.espressif/tools/xtensa-esp-elf/esp-14.2.0_20260121/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc.exe",
+        "C_Cpp.default.cStandard": "gnu17",
+        "C_Cpp.default.intelliSenseMode": "gcc-x64",
+        "clangd.arguments": [
+            "--compile-commands-dir=${workspaceFolder}/build",
+            "--query-driver=C:/Users/fengyh/.espressif/tools/xtensa-esp-elf/**/xtensa-esp32s3-elf-gcc.exe"
+        ],
+        "files.associations": {
+            "*.h": "c"
+        },
+        "idf.buildPathWin": "${workspaceFolder}\\build",
+        "idf.portWin": "COM7"
+    }
+}
