@@ -1,9 +1,0 @@
-{
-  "files.associations": {
-    "*.ino": "cpp"
-  },
-  "C_Cpp.intelliSenseEngine": "default",
-  "C_Cpp.errorSquiggles": "enabled",
-  "C_Cpp.intelliSenseUpdateDelay": 2000,
-  "terminal.integrated.defaultProfile.windows": "PowerShell"
-}

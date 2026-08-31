@@ -1,77 +1,48 @@
-# ESP32-S3 三轮巡线避障小车 v20（VS Code 版）
+# ESP32-S3 单摄像头黑线巡线
 
-本工程使用 **VS Code + Arduino CLI**。核心程序与已记录的 Arduino v20 源码逐字节一致，没有改动巡线、转弯、避障、编码器、终点停车或 TFT 显示逻辑。
+本仓库是小车摄像头巡线的精简共享版本。JQ-CAM12 通过 USB Host 连接 ESP32-S3，由芯片本地完成 MJPEG 解码、黑线检测、前视预测和 TB6612 电机控制；正常运行不依赖电脑或 Python。
 
-## 为什么没有改成纯 ESP-IDF
-
-原程序直接使用 Arduino API、`Adafruit_GFX` 和 `Adafruit_ST7735`。改成纯 ESP-IDF 需要重写 PWM、串口、GPIO、中断、任务和屏幕驱动，风险较大，也可能改变已经实测成功的小车行为。因此本工程只更换编辑、编译和烧录入口，不重写控制逻辑。
-
-## 工程结构
+## 目录
 
 ```text
-v20_line_car_vscode/
-├─ .vscode/
-│  ├─ extensions.json    推荐安装的 VS Code 扩展
-│  ├─ settings.json      编辑器设置
-│  └─ tasks.json         编译、烧录、串口监视任务
-├─ .gitignore
-├─ README.md
-└─ v20_line_car_vscode.ino   完整小车程序
+esp32_car_vision/          ESP-IDF 摄像头巡线主工程
+  main/car_vision_main.c   识别、预测、状态机和电机控制
+  main/tjpgd.*             Tiny JPEG Decoder
+  README.md                编译、烧录和调参说明
+test/line_detect.py        电脑端 OpenCV 阈值标定工具
+v20_line_car_vscode.ino    原 v20 小车控制程序，保留作参考
+摄像头型号与使用说明.md     摄像头接线与硬件记录
 ```
 
-## 已知环境要求
+## 当前硬件映射
 
-- VS Code
-- Arduino CLI：`C:\Program Files\Arduino CLI\arduino-cli.exe`
-- ESP32 Arduino Core，开发板 FQBN：`esp32:esp32:esp32s3`
-- Adafruit GFX Library
-- Adafruit ST7735 and ST7789 Library
-- Adafruit BusIO
-- ESP32-S3 对应的 USB 转串口驱动
+- 摄像头：`GPIO19=D-`、`GPIO20=D+`，另接稳定的 `5V/GND`
+- TB6612：`STBY=GPIO10`
+- 左前 A：`PWM/IN1/IN2 = GPIO11/12/13`
+- 后轮 B：`GPIO14/15/16`，摄像头巡线时保持停止
+- 右前 D：`PWM/IN1/IN2 = GPIO17/18/21`
 
-## 第一次打开
+## 快速开始
 
-1. 在 VS Code 中选择“文件 → 打开文件夹”。
-2. 打开本 `v20_line_car_vscode` 文件夹，不要只打开 `.ino` 文件。
-3. 如果 VS Code 提示推荐扩展，可安装：
-   - C/C++
-   - Arduino Community Edition
-4. 按 `Ctrl+Shift+P`，输入“运行任务”。
-5. 先运行 `Arduino: 查看开发板和串口`，确认开发板对应哪个 COM 口。
+安装 ESP-IDF 5.4.x，在 ESP-IDF PowerShell 中运行：
 
-## 编译
+```powershell
+cd esp32_car_vision
+idf.py set-target esp32s3
+idf.py build
+idf.py -p COM7 flash monitor
+```
 
-按 `Ctrl+Shift+B`，默认执行 `Arduino: 编译 ESP32-S3`。
+退出串口监视器按 `Ctrl+]`。固件当前启用了电机，烧录或复位前必须将小车架空。具体调参方法见 [esp32_car_vision/README.md](esp32_car_vision/README.md)。
 
-编译产物放在 `.build` 目录，不会污染源码目录。
+## 当前控制策略
 
-## 烧录
+- 灰度阈值分割黑线，只选择与画面底部相连的主要区域
+- 近、中、远三个观察区联合估计方向
+- 连续多帧确认后驱动
+- 短时丢线保持最后方向，超过限制立即停车
+- 当前实车调参值以 `car_vision_main.c` 顶部宏定义为准
 
-1. 用小车开发板的 UART USB 口连接电脑。
-2. 关闭 Arduino IDE 串口监视器以及其他占用串口的软件。
-3. 按 `Ctrl+Shift+P` → “运行任务”。
-4. 选择 `Arduino: 烧录 ESP32-S3`。
-5. 输入实际串口，例如 `COM7`。
+## 安全说明
 
-如果提示无法连接：按住 `BOOT`，短按一次 `RESET`，松开 `RESET`，再松开 `BOOT`，然后重新烧录。
-
-## 查看串口日志
-
-运行任务 `Arduino: 打开串口监视器`，输入实际 COM 口。波特率已经设置为 `115200`。
-
-退出串口监视器时，在终端中按 `Ctrl+C`。
-
-## 烧录后独立运行
-
-烧录完成后可以拔掉电脑 USB，但必须保留小车自己的稳定供电。重新上电或短按 `RESET` 后，程序会从 `setup()` 开始自动运行。
-
-## 当前验证状态
-
-- 已确认 VS Code 主程序存在。
-- 已确认 Arduino CLI 位于预期路径。
-- 已确认三个 Adafruit 依赖库能够被 Arduino CLI 列出。
-- 已生成完整 VS Code 工程和任务配置。
-- 核心 `.ino` 与 Arduino v20 存档 SHA-256 完全一致。
-- 当前受权限限制，尚未成功读取 ESP32 Core 清单和 VS Code 扩展清单，也尚未完成本工程的实际编译。
-- 当前只看到 COM3、COM4、COM5、COM6，均显示为 `Serial Port Unknown`；这不能证明其中任何一个就是 ESP32-S3。烧录前应重新插拔开发板并确认新增的 COM 口。
-
+首次使用或修改转向参数后，必须先架空检查左右轮方向和 `LOST_STOP`。摄像头断线、电机方向异常或串口出现崩溃日志时，不要直接落地运行。

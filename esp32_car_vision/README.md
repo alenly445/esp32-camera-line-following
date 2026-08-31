@@ -1,56 +1,87 @@
-# WiFi 实时画面：esp32_uvc_stream
+# ESP32-S3 单摄像头预测巡线（第一版）
 
-ESP32-S3 从 JQ-CAM12 取 MJPEG 流，通过 WiFi 提供网页视频流。电脑/手机浏览器直接看画面。**这也是以后调巡线的主力工具。**
+这个工程在 ESP32-S3 上直接读取 JQ-CAM12 的 MJPEG 图像、识别黑线并控制 TB6612。运行时不需要电脑和 Python。当前实车参数为 `threshold=110`、`ROI=0.70`、`BASE_PWM=45`，以后以源文件顶部宏定义为准。
 
-实测帧率取决于 WiFi 环境：手机热点宿舍环境约 5~8fps（640x480，峰值 ~500KB/s）；信号好的路由器可到 10~15fps。固件已开大 TCP 窗口（23KB）并关闭 WiFi 省电，这两个是流媒体必做项。想要更高帧率把 `CAM_WIDTH/HEIGHT` 改成 480x320（帧体积约减半，帧率约翻倍）。
+## 为什么能处理车底盲区
 
-## 首次使用：填 WiFi
+摄像头看不到车轮脚下约 10 cm 是正常的。程序把可见地面分成远、中、近三段，按 `15% / 25% / 60%` 计算目标方向；近处决定当前偏差，远处提前反映弯道趋势。黑线刚进入车底而消失时，程序最多保持最后方向 6 帧（约 0.24 秒），随后仍未重新看到黑线就停车。
 
-编辑 [main/wifi_credentials.h](main/wifi_credentials.h)（该文件在 .gitignore 里，不会把密码推上 GitHub；模板见 `wifi_credentials.example.h`）。两种模式：
+这不是长时间“猜路”。单摄像头没有脚下观测，预测只能跨越很短的盲区；急弯需要降低速度和保持足够宽的黑线。
 
-- **校园网 802.1X**（Tsinghua-Secure 等）：`WIFI_USE_ENTERPRISE = 1`，填学号和校园网密码（即登录 net.tsinghua.edu.cn 的密码）。固件用 PEAP/MSCHAPv2 认证
-- **家庭 WiFi / 手机热点**：`WIFI_USE_ENTERPRISE = 0`，填 `WIFI_SSID` + `WIFI_PASSWORD`（必须是 2.4GHz 频段）
+## 关键安全设置
 
-改完重新烧录。
+小组成员首次烧录前，建议先把代码中的设置改为：
 
-## 编译烧录
+```c
+#define MOTOR_OUTPUT_ENABLED 0
+```
 
-用 VSCode 的 ESP-IDF 插件单独打开本文件夹（或 ESP-IDF PowerShell）：
+此时摄像头和算法运行，但 STBY 保持关闭，电机不会转。当前仓库为了保留已经验证的实车状态设为 `1`；确认识别方向和电机接线前，不要直接落地运行。
+
+电机映射：A 左前 `11/12/13`，B 后轮 `14/15/16`（巡线保持停止），D 右前 `17/18/21`，STBY `GPIO10`。
+
+## 1. 编译、烧录和串口
+
+在 VS Code 打开“ESP-IDF PowerShell”终端，执行：
 
 ```powershell
-idf.py set-target esp32s3     # 仅第一次
+cd esp32_car_vision
+idf.py set-target esp32s3
 idf.py build
 idf.py -p COM7 flash monitor
 ```
 
-上电后串口会打印：
+如果普通 PowerShell 找不到 `idf.py`，先执行：
 
-```
-I (xxxx) uvc_stream: ========================================
-I (xxxx) uvc_stream:   WiFi connected! IP: 192.168.1.23
-I (xxxx) uvc_stream:   Browser open: http://192.168.1.23/
-I (xxxx) uvc_stream: ========================================
+```powershell
+& 'C:\esp\v5.4.4\esp-idf\export.ps1'
 ```
 
-## 看画面
+退出串口监视器：按 `Ctrl+]`。如果 COM7 显示拒绝访问，先关闭其他串口监视器、Arduino IDE 和占用串口的终端，再重试；不要同时开两个 monitor。
 
-电脑（连同一个 WiFi）浏览器打开串口里显示的地址：
+## 2. 电机关闭状态下验证识别
 
-| 地址 | 用途 |
-|---|---|
-| `http://<IP>/` | 带播放器的页面 |
-| `http://<IP>/stream` | 裸 MJPEG 流（可直接贴进 `<img>` 标签） |
-| `http://<IP>/snapshot` | 单帧 JPEG（写脚本抓图方便） |
+将车架垫高或拆下轮胎，摄像头对准实际赛道。串口每 5 帧显示一次：
 
-同时只支持一个观看客户端；第二个打开 `/stream` 的会显示失败，关掉第一个再开。
+```text
+state=TRACK decode=1 area=... x=近/中/远 error=... motor=DRY
+```
 
-## 改分辨率
+依次做四个测试：
 
-[main/uvc_stream_main.c](main/uvc_stream_main.c) 顶部 `CAM_WIDTH / CAM_HEIGHT / CAM_FPS`。摄像头实测支持：1280x720@15、800x480@20、640x480@25（默认，巡线甜点档）、480x320@25、480x854@25。
+1. 黑线在画面中央：应为 `TRACK`，`error` 接近 0。
+2. 黑线移到画面左侧：`error` 应为负数。
+3. 黑线移到画面右侧：`error` 应为正数。
+4. 挡住或移走黑线：先出现不超过 6 帧的 `BLIND_HOLD`，然后必须是 `LOST_STOP`。
 
-## 常见问题
+`x=近/中/远` 是三个观察区域内的线中心。急弯时三个数通常逐渐错开，这正是前视预测所需的信息。
 
-- **一直 "WiFi lost, reconnecting"**：检查 SSID/密码；确认路由器是 2.4GHz；有些路由器把新设备隔离在访客网络，看路由器后台
-- **IP 打不开**：电脑和板子必须连**同一个**路由器；公司/学校 WiFi 常开设备隔离，家里的一般没问题
-- **`Open failed` 反复重试**：摄像头没接好（19/20/5V/GND）
-- **画面卡顿**：正常现象与 WiFi 信号相关；`/snapshot` 不受影响
+## 3. 解锁电机并架空测试
+
+上述结果正确后，把 `main/car_vision_main.c` 中 `MOTOR_OUTPUT_ENABLED` 改成 `1`，重新 `build`、`flash monitor`。车轮必须离地：
+
+- 中线：A、D 两轮低速前进，B 不转。
+- 线在左边：车辆控制量应向左修正。
+- 线在右边：车辆控制量应向右修正。
+- 丢线超过 6 帧：所有电机停止。
+
+如果左右修正完全相反，先不要落地测试；这通常是整车左右轮定义或某个电机接线方向与当前映射相反，需要根据架空结果修正。
+
+## 4. 落地低速调试顺序
+
+一次只改一个参数：
+
+1. `BLACK_THRESHOLD`：mask 漏掉黑线就增大；地砖阴影也变黑就减小。先在 120～140 内调整。
+2. `MIN_COMPONENT_AREA`：噪声被当成线就增大；远处细线总是 LOST 就减小。
+3. `BASE_PWM`：当前为 45。新车首次测试建议从 32 开始；急弯冲出路线时先降速，不要先增加转向增益。
+4. `MAX_CORRECTION`：修正不足再小幅增大；左右摆动就减小。
+5. `BLIND_HOLD_FRAMES`：只负责跨过车底短盲区。过小会提前停车，过大会在真正丢线后盲走。
+
+建议先测试 1 米直线，再测试大半径弯道，最后才测试急弯。每次记录 `error`、状态和车辆实际方向。任何方向不确定时，立即断开电机电源；固件的 LOST 停车不是机械急停的替代品。
+
+## 当前算法边界
+
+- 只选择与底部观察条相连的最大黑色区域，尽量排除远处横线和家具阴影。
+- 连续 3 帧确认后才进入 TRACK。
+- 预测来自当前画面的远/中/近几何关系和最后可靠误差，不是机器学习模型。
+- 第一版不处理十字路口、分叉路线和 90 度直角的路线选择；这些需要单独定义“应该选哪条路”的规则。

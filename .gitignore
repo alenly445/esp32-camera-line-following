@@ -4,6 +4,7 @@ test/output/
 **/__pycache__/
 *.pyc
 **/sdkconfig.old
+**/sdkconfig
 **/build/
 **/managed_components/
 **/main/wifi_credentials.h

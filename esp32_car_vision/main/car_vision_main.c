@@ -1,402 +1,328 @@
-/*
- * WiFi MJPEG 实时视频流：JQ-CAM12-720P 接 GPIO19=D- / GPIO20=D+，浏览器看画面
- *
- * 浏览器访问：
- *   http://<板子的IP>/          带播放器的页面
- *   http://<板子的IP>/stream    裸 MJPEG 流（10~25fps）
- *   http://<板子的IP>/snapshot  单帧 JPEG 快照
- *
- * 流程：UVC 取流(640x480@25 MJPEG) → 有浏览器客户端时把最新帧经 WiFi 发出，
- * 没有客户端时立即丢帧（省带宽省内存）。只支持一个观看客户端。
- */
-
+/* ESP32-S3 + USB UVC camera predictive line following, first safe version. */
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "freertos/queue.h"
-#include "freertos/event_groups.h"
-#include "esp_log.h"
-#include "esp_err.h"
-#include "esp_event.h"
-#include "esp_wifi.h"
-#include "esp_eap_client.h"
-#include "esp_netif.h"
-#include "nvs_flash.h"
-#include "esp_http_server.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "esp_heap_caps.h"
-#include "lwip/sockets.h"
+#include "esp_log.h"
 #include "usb/usb_host.h"
 #include "usb/uvc_host.h"
-#include "wifi_credentials.h"
+#include "tjpgd.h"
 
-#define USB_HOST_PRIORITY   (15)
-#define FRAME_BUFFERS       (5)
+#define CAM_W 640
+#define CAM_H 480
+#define CAM_FPS 25
+#define IMG_W 320
+#define IMG_H 240
 
-#define STRINGIFY_(x) #x
-#define STRINGIFY(x) STRINGIFY_(x)
+/* Current on-car tuning; ROI_TOP=168 corresponds to ROI=0.70 at 240 px. */
+#define BLACK_THRESHOLD 110
+#define ROI_TOP 168
+#define NEAR_TOP 222
+#define MID_TOP 198
+#define MIN_COMPONENT_AREA 250
+#define CONFIRM_FRAMES 3
+#define BLIND_HOLD_FRAMES 6
 
-/* 巡线甜点档位；想要别的分辨率改这里（摄像头支持：1280x720@15 / 800x480@20 / 640x480@25 / 480x320@25） */
-#define CAM_WIDTH           (640)
-#define CAM_HEIGHT          (480)
-#define CAM_FPS             (25.0f)
+/* Keep this at 0 for serial-only dry-run. Change to 1 only after wheel-up tests. */
+#define MOTOR_OUTPUT_ENABLED 1
+#define BASE_PWM 45
+#define HOLD_PWM 24
+#define MAX_CORRECTION 18
 
-static const char *TAG = "uvc_stream";
+#define STBY_PIN 10
+#define PWMA_PIN 11
+#define AIN1_PIN 12
+#define AIN2_PIN 13
+#define PWMB_PIN 14
+#define BIN1_PIN 15
+#define BIN2_PIN 16
+#define PWMD_PIN 17
+#define DIN1_PIN 18
+#define DIN2_PIN 21
 
-static QueueHandle_t s_frame_q;         /* 驱动 -> 帧任务 */
-static QueueHandle_t s_send_q;          /* 帧任务 -> HTTP 线程（仅在有观众时使用） */
-static volatile int s_clients = 0;      /* 正在观看的浏览器数量 */
-static volatile bool s_stream_ok = false;
-static volatile uint32_t s_rx_count = 0, s_send_count = 0;
-static uvc_host_stream_hdl_t s_stream = NULL;
+#define FRAME_BUFFERS 3
+#define USB_PRIORITY 15
 
-static EventGroupHandle_t s_wifi_events;
+static const char *TAG = "car_vision";
+static QueueHandle_t s_frame_q;
+static volatile bool s_connected;
+static uvc_host_stream_hdl_t s_stream;
+static uint8_t *s_gray, *s_mask;
+static uint32_t *s_queue;
+static volatile bool s_frame_task_running;
 
-/* 单帧 HTTP 发送缓冲（边界行+头+JPEG 拼成一整包，避免 Nagle 小包 stalls） */
-#define PART_BUF_SIZE   (96 * 1024)
-static uint8_t *s_part_buf;
-#define WIFI_CONNECTED_BIT  BIT0
-#define WIFI_FAIL_BIT       BIT1
+typedef struct { const uint8_t *data; size_t size, pos; } jpeg_src_t;
+typedef struct { bool found; int area, near_x, mid_x, far_x, error; } line_result_t;
 
-static const char *RESP_HTML =
-    "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
-    "<title>ESP32-S3 摄像头</title>"
-    "<style>body{font-family:sans-serif;background:#111;color:#eee;text-align:center;margin:0}"
-    "img{max-width:100%;max-height:92vh}p a{color:#8cf}</style></head><body>"
-    "<h3>ESP32-S3 + JQ-CAM12 实时画面 " STRINGIFY(CAM_WIDTH) "x" STRINGIFY(CAM_HEIGHT) "@25</h3>"
-    "<img src=\"/stream\" alt=\"live\">"
-    "<p><a href=\"/snapshot\">单帧快照 /snapshot</a></p></body></html>";
-
-/* ---------------- UVC 取流部分（与 esp32_uvc_test 相同模式） ---------------- */
-
-bool frame_callback(const uvc_host_frame_t *frame, void *user_ctx)
+static int clampi(int value, int low, int high)
 {
-    QueueHandle_t q = *((QueueHandle_t *)user_ctx);
-    /* 与已验证的取流测试相同：帧永远先进队列，由帧任务统一处理 */
-    if (xQueueSendToBack(q, &frame, 0) != pdPASS) {
-        return true;    /* 队列满，丢最慢的帧 */
-    }
-    return false;       /* 所有权移交，稍后归还 */
+    return value < low ? low : (value > high ? high : value);
 }
 
-static void stream_callback(const uvc_host_stream_event_data_t *event, void *user_ctx)
+static void motor_channel_init(ledc_channel_t channel, int pin)
 {
-    (void)user_ctx;
-    switch (event->type) {
-    case UVC_HOST_TRANSFER_ERROR:
-        ESP_LOGE(TAG, "USB transfer error, errno = %i", event->transfer_error.error);
-        break;
-    case UVC_HOST_DEVICE_DISCONNECTED:
-        ESP_LOGW(TAG, "Camera disconnected");
-        s_stream_ok = false;
-        uvc_host_stream_close(event->device_disconnected.stream_hdl);
-        break;
-    case UVC_HOST_FRAME_BUFFER_OVERFLOW:
-        ESP_LOGW(TAG, "Frame buffer overflow");
-        break;
-    case UVC_HOST_FRAME_BUFFER_UNDERFLOW:
-        ESP_LOGW(TAG, "Frame buffer underflow");
-        break;
-    default:
-        break;
+    ledc_channel_config_t cfg = {
+        .gpio_num = pin, .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = channel, .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = LEDC_TIMER_0, .duty = 0, .hpoint = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&cfg));
+}
+
+static void motors_init(void)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << STBY_PIN) | (1ULL << AIN1_PIN) | (1ULL << AIN2_PIN) |
+                        (1ULL << BIN1_PIN) | (1ULL << BIN2_PIN) |
+                        (1ULL << DIN1_PIN) | (1ULL << DIN2_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));
+    gpio_set_level(STBY_PIN, 0);
+    ledc_timer_config_t timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE, .duty_resolution = LEDC_TIMER_8_BIT,
+        .timer_num = LEDC_TIMER_0, .freq_hz = 10000, .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer));
+    motor_channel_init(LEDC_CHANNEL_0, PWMA_PIN);
+    motor_channel_init(LEDC_CHANNEL_1, PWMB_PIN);
+    motor_channel_init(LEDC_CHANNEL_2, PWMD_PIN);
+    ESP_LOGW(TAG, "motor output: %s", MOTOR_OUTPUT_ENABLED ? "ENABLED" : "DRY RUN");
+}
+
+static void set_motor(ledc_channel_t channel, int in1, int in2, int pwm)
+{
+    pwm = clampi(pwm, -255, 255);
+    gpio_set_level(in1, pwm > 0);
+    gpio_set_level(in2, pwm < 0);
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, channel, abs(pwm)));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, channel));
+}
+
+static void drive(int left, int right)
+{
+    if (!MOTOR_OUTPUT_ENABLED) return;
+    gpio_set_level(STBY_PIN, (left != 0 || right != 0));
+    set_motor(LEDC_CHANNEL_0, AIN1_PIN, AIN2_PIN, left);
+    set_motor(LEDC_CHANNEL_1, BIN1_PIN, BIN2_PIN, 0); /* rear motor stays stopped */
+    set_motor(LEDC_CHANNEL_2, DIN1_PIN, DIN2_PIN, right);
+}
+
+static size_t jpeg_input(JDEC *jd, uint8_t *buf, size_t len)
+{
+    jpeg_src_t *src = jd->device;
+    size_t available = src->size - src->pos;
+    if (len > available) len = available;
+    if (buf) memcpy(buf, src->data + src->pos, len);
+    src->pos += len;
+    return len;
+}
+
+static int jpeg_output(JDEC *jd, void *bitmap, JRECT *rect)
+{
+    (void)jd;
+    uint8_t *src = bitmap;
+    unsigned width = rect->right - rect->left + 1;
+    for (unsigned y = rect->top; y <= rect->bottom && y < IMG_H; y++) {
+        unsigned copy = width;
+        if (rect->left + copy > IMG_W) copy = IMG_W - rect->left;
+        memcpy(s_gray + y * IMG_W + rect->left, src, copy);
+        src += width;
     }
+    return 1;
+}
+
+static bool decode_jpeg(const uint8_t *data, size_t size)
+{
+    uint8_t work[4096];
+    JDEC decoder;
+    jpeg_src_t src = {.data = data, .size = size, .pos = 0};
+    memset(s_gray, 255, IMG_W * IMG_H);
+    JRESULT result = jd_prepare(&decoder, jpeg_input, work, sizeof(work), &src);
+    if (result != JDR_OK) return false;
+    if (decoder.width != CAM_W || decoder.height != CAM_H) return false;
+    return jd_decomp(&decoder, jpeg_output, 1) == JDR_OK; /* 1/2 -> 320x240 */
+}
+
+static line_result_t detect_line(void)
+{
+    line_result_t out = {.near_x = -1, .mid_x = -1, .far_x = -1};
+    memset(s_mask, 0, IMG_W * IMG_H);
+    for (int y = ROI_TOP; y < IMG_H; y++)
+        for (int x = 0; x < IMG_W; x++)
+            s_mask[y * IMG_W + x] = s_gray[y * IMG_W + x] < BLACK_THRESHOLD ? 1 : 0;
+
+    int best_area = 0, best_near_sum = 0, best_near_n = 0;
+    int best_mid_sum = 0, best_mid_n = 0, best_far_sum = 0, best_far_n = 0;
+    for (int sy = NEAR_TOP; sy < IMG_H; sy++) {
+        for (int sx = 0; sx < IMG_W; sx++) {
+            int start = sy * IMG_W + sx;
+            if (s_mask[start] != 1) continue;
+            size_t head = 0, tail = 0;
+            int area = 0, ns = 0, nn = 0, ms = 0, mn = 0, fs = 0, fn = 0;
+            s_mask[start] = 2;
+            s_queue[tail++] = start;
+            while (head < tail) {
+                int p = (int)s_queue[head++], x = p % IMG_W, y = p / IMG_W;
+                area++;
+                if (y >= NEAR_TOP) { ns += x; nn++; }
+                else if (y >= MID_TOP) { ms += x; mn++; }
+                else { fs += x; fn++; }
+                const int next[4] = {p - 1, p + 1, p - IMG_W, p + IMG_W};
+                if (x > 0 && s_mask[next[0]] == 1) { s_mask[next[0]] = 2; s_queue[tail++] = next[0]; }
+                if (x + 1 < IMG_W && s_mask[next[1]] == 1) { s_mask[next[1]] = 2; s_queue[tail++] = next[1]; }
+                if (y > ROI_TOP && s_mask[next[2]] == 1) { s_mask[next[2]] = 2; s_queue[tail++] = next[2]; }
+                if (y + 1 < IMG_H && s_mask[next[3]] == 1) { s_mask[next[3]] = 2; s_queue[tail++] = next[3]; }
+            }
+            if (area > best_area) {
+                best_area = area; best_near_sum = ns; best_near_n = nn;
+                best_mid_sum = ms; best_mid_n = mn; best_far_sum = fs; best_far_n = fn;
+            }
+        }
+    }
+    if (best_area < MIN_COMPONENT_AREA || best_near_n == 0) return out;
+    out.found = true; out.area = best_area;
+    out.near_x = best_near_sum / best_near_n;
+    out.mid_x = best_mid_n ? best_mid_sum / best_mid_n : out.near_x;
+    out.far_x = best_far_n ? best_far_sum / best_far_n : out.mid_x;
+    int target_x = (60 * out.near_x + 25 * out.mid_x + 15 * out.far_x) / 100;
+    out.error = target_x - IMG_W / 2;
+    return out;
+}
+
+static bool frame_callback(const uvc_host_frame_t *frame, void *ctx)
+{
+    QueueHandle_t queue = ctx;
+    uvc_host_frame_t *mutable_frame = (uvc_host_frame_t *)frame;
+    if (xQueueSend(queue, &mutable_frame, 0) != pdPASS) return true;
+    return false;
+}
+
+static void stream_callback(const uvc_host_stream_event_data_t *event, void *ctx)
+{
+    (void)ctx;
+    if (event->type == UVC_HOST_DEVICE_DISCONNECTED) {
+        s_connected = false;
+    }
+}
+
+static void frame_task(void *arg)
+{
+    (void)arg;
+    int confirmed = 0, missing = 0, last_error = 0;
+    unsigned frame_no = 0;
+    while (s_connected) {
+        uvc_host_frame_t *frame;
+        if (xQueueReceive(s_frame_q, &frame, pdMS_TO_TICKS(500)) != pdPASS) {
+            drive(0, 0); continue;
+        }
+        line_result_t line = {0};
+        bool decoded = decode_jpeg(frame->data, frame->data_len);
+        if (decoded) line = detect_line();
+        if (line.found) {
+            missing = 0;
+            if (confirmed < CONFIRM_FRAMES) confirmed++;
+            if (confirmed >= CONFIRM_FRAMES) {
+                last_error = (3 * last_error + line.error) / 4;
+                int correction = clampi(last_error * MAX_CORRECTION / (IMG_W / 2), -MAX_CORRECTION, MAX_CORRECTION);
+                drive(BASE_PWM - correction, BASE_PWM + correction);
+            } else drive(0, 0);
+        } else {
+            confirmed = 0;
+            missing++;
+            if (missing <= BLIND_HOLD_FRAMES) {
+                int correction = clampi(last_error * MAX_CORRECTION / (IMG_W / 2), -MAX_CORRECTION, MAX_CORRECTION);
+                drive(HOLD_PWM - correction, HOLD_PWM + correction);
+            } else drive(0, 0);
+        }
+        if (++frame_no % 5 == 0) {
+            const char *state = line.found ? (confirmed >= CONFIRM_FRAMES ? "TRACK" : "CONFIRM")
+                                           : (missing <= BLIND_HOLD_FRAMES ? "BLIND_HOLD" : "LOST_STOP");
+            ESP_LOGI(TAG, "state=%s decode=%d area=%d x=%d/%d/%d error=%d motor=%s",
+                     state, decoded, line.area, line.near_x, line.mid_x, line.far_x,
+                     line.found ? line.error : last_error,
+                     MOTOR_OUTPUT_ENABLED ? "ON" : "DRY");
+        }
+        uvc_host_frame_return(s_stream, frame);
+        /* JPEG decoding is CPU-heavy; let IDLE1 run so its watchdog is fed. */
+        vTaskDelay(1);
+    }
+    drive(0, 0);
+    uvc_host_frame_t *pending;
+    while (xQueueReceive(s_frame_q, &pending, 0) == pdPASS)
+        uvc_host_frame_return(s_stream, pending);
+    s_frame_task_running = false;
+    vTaskDelete(NULL);
+}
+
+static void camera_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        uvc_host_stream_config_t cfg = {
+            .event_cb = stream_callback, .frame_cb = frame_callback, .user_ctx = s_frame_q,
+            .usb = {.vid = UVC_HOST_ANY_VID, .pid = UVC_HOST_ANY_PID, .uvc_stream_index = 0},
+            .vs_format = {.h_res = CAM_W, .v_res = CAM_H, .fps = CAM_FPS, .format = UVC_VS_FORMAT_MJPEG},
+            .advanced = {.number_of_frame_buffers = FRAME_BUFFERS, .frame_size = 0,
+                         .number_of_urbs = 4, .urb_size = 10 * 1024},
+        };
+        if (uvc_host_stream_open(&cfg, pdMS_TO_TICKS(5000), &s_stream) != ESP_OK) {
+            ESP_LOGW(TAG, "camera open failed; retrying"); vTaskDelay(pdMS_TO_TICKS(3000)); continue;
+        }
+        s_connected = true;
+        ESP_ERROR_CHECK(uvc_host_stream_start(s_stream));
+        ESP_LOGI(TAG, "camera streaming: %dx%d@%d MJPEG", CAM_W, CAM_H, CAM_FPS);
+        s_frame_task_running = true;
+        xTaskCreatePinnedToCore(frame_task, "vision", 16384, NULL, USB_PRIORITY - 2, NULL, 1);
+        while (s_connected) vTaskDelay(pdMS_TO_TICKS(200));
+        drive(0, 0);
+        while (s_frame_task_running) vTaskDelay(pdMS_TO_TICKS(10));
+        esp_err_t close_err = uvc_host_stream_close(s_stream);
+        if (close_err != ESP_OK) ESP_LOGW(TAG, "stream close failed: %s", esp_err_to_name(close_err));
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+static void uvc_event_callback(const uvc_host_driver_event_data_t *event, void *ctx)
+{
+    (void)ctx;
+    if (event->type == UVC_HOST_DRIVER_EVENT_DEVICE_CONNECTED)
+        ESP_LOGI(TAG, "camera connected, USB address=%d", event->device_connected.dev_addr);
 }
 
 static void usb_lib_task(void *arg)
 {
     (void)arg;
-    while (1) {
-        uint32_t event_flags;
-        usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
-        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
-            usb_host_device_free_all();
-        }
+    while (true) {
+        uint32_t flags;
+        usb_host_lib_handle_events(portMAX_DELAY, &flags);
     }
 }
-
-static void frame_handling_task(void *arg)
-{
-    (void)arg;
-    while (1) {
-        uvc_host_stream_config_t stream_config = {
-            .event_cb = stream_callback,
-            .frame_cb = frame_callback,
-            .user_ctx = &s_frame_q,
-            .usb = {
-                .vid = UVC_HOST_ANY_VID,
-                .pid = UVC_HOST_ANY_PID,
-                .uvc_stream_index = 0,
-            },
-            .vs_format = {
-                .h_res = CAM_WIDTH,
-                .v_res = CAM_HEIGHT,
-                .fps = CAM_FPS,
-                .format = UVC_VS_FORMAT_MJPEG,
-            },
-            .advanced = {
-                .number_of_frame_buffers = FRAME_BUFFERS,
-                .frame_size = 0,            /* 按格式自动 */
-                .number_of_urbs = 4,
-                .urb_size = 10 * 1024,
-            },
-        };
-
-        ESP_LOGI(TAG, "Opening camera %ux%u@%.0f MJPEG ...", CAM_WIDTH, CAM_HEIGHT, CAM_FPS);
-        if (uvc_host_stream_open(&stream_config, pdMS_TO_TICKS(5000), &s_stream) != ESP_OK) {
-            ESP_LOGW(TAG, "Open failed (camera plugged into GPIO19/20?), retry in 5s ...");
-            vTaskDelay(pdMS_TO_TICKS(5000));
-            continue;
-        }
-        ESP_LOGI(TAG, "Camera OPENED");
-        s_stream_ok = true;
-        uvc_host_stream_start(s_stream);
-
-        TickType_t last_stat = xTaskGetTickCount();
-        while (s_stream_ok) {
-            uvc_host_frame_t *frame;
-            if (xQueueReceive(s_frame_q, &frame, pdMS_TO_TICKS(100)) == pdPASS) {
-                s_rx_count++;
-                if (s_clients > 0 && xQueueSendToBack(s_send_q, &frame, 0) == pdPASS) {
-                    s_send_count++;     /* 所有权转给 HTTP 线程 */
-                } else if (s_stream_ok) {
-                    uvc_host_frame_return(s_stream, frame);     /* 没观众或发送队列满：丢帧 */
-                }
-            }
-            /* 观众刚走：清空积压的发送队列，防止帧缓冲泄漏 */
-            while (s_clients == 0 && xQueueReceive(s_send_q, &frame, 0) == pdPASS) {
-                if (s_stream_ok) {
-                    uvc_host_frame_return(s_stream, frame);
-                }
-            }
-            if (xTaskGetTickCount() - last_stat >= pdMS_TO_TICKS(5000)) {
-                last_stat = xTaskGetTickCount();
-                ESP_LOGI(TAG, "stat: stream_ok=%d clients=%d rx=%u sent=%u",
-                         (int)s_stream_ok, s_clients,
-                         (unsigned)s_rx_count, (unsigned)s_send_count);
-            }
-        }
-        ESP_LOGW(TAG, "waiting for camera reconnection ...");
-    }
-}
-
-static void uvc_event_cb(const uvc_host_driver_event_data_t *event, void *user_ctx)
-{
-    (void)user_ctx;
-    if (event->type == UVC_HOST_DRIVER_EVENT_DEVICE_CONNECTED) {
-        ESP_LOGI(TAG, "Camera connected, addr %d", event->device_connected.dev_addr);
-        /* 取流生命周期由 frame_handling_task 管理 */
-    }
-}
-
-/* ---------------- HTTP 服务 ---------------- */
-
-#define STREAM_BOUNDARY "frameboundary"
-
-static esp_err_t handler_index(httpd_req_t *req)
-{
-    httpd_resp_set_type(req, "text/html; charset=utf-8");
-    return httpd_resp_send(req, RESP_HTML, HTTPD_RESP_USE_STRLEN);
-}
-
-static esp_err_t handler_snapshot(httpd_req_t *req)
-{
-    s_clients++;
-    uvc_host_frame_t *frame = NULL;
-    esp_err_t ret = ESP_FAIL;
-    if (xQueueReceive(s_send_q, &frame, pdMS_TO_TICKS(2000)) == pdPASS) {
-        httpd_resp_set_type(req, "image/jpeg");
-        ret = httpd_resp_send(req, (const char *)frame->data, frame->data_len);
-        if (s_stream_ok) {
-            uvc_host_frame_return(s_stream, frame);
-        }
-    } else {
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        httpd_resp_set_type(req, "text/plain");
-        ret = httpd_resp_send(req, "no frame (camera not streaming?)", HTTPD_RESP_USE_STRLEN);
-    }
-    s_clients--;
-    return ret;
-}
-
-static esp_err_t handler_stream(httpd_req_t *req)
-{
-    s_clients++;
-    ESP_LOGI(TAG, "Browser client connected (%d watching)", s_clients);
-
-    /* 必须用 chunked API：它会自动先发 HTTP 状态行+响应头，再逐块发数据 */
-    httpd_resp_set_type(req, "multipart/x-mixed-replace; boundary=" STREAM_BOUNDARY);
-    /* 关闭 Nagle：小包立即发出，否则和延迟 ACK 互相等待会把帧率拖到 ~1fps */
-    int sockfd = httpd_req_to_sockfd(req);
-    int nodelay = 1;
-    setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-    esp_err_t ret = ESP_OK;
-
-    while (ret == ESP_OK && s_stream_ok) {
-        uvc_host_frame_t *frame;
-        if (xQueueReceive(s_send_q, &frame, pdMS_TO_TICKS(5000)) != pdPASS) {
-            break;  /* 5 秒没帧，断开这个客户端 */
-        }
-        int n = snprintf((char *)s_part_buf, PART_BUF_SIZE,
-                         "--" STREAM_BOUNDARY "\r\n"
-                         "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-                         (unsigned)frame->data_len);
-        if (n > 0 && (size_t)n + frame->data_len + 2 <= PART_BUF_SIZE) {
-            memcpy(s_part_buf + n, frame->data, frame->data_len);
-            n += frame->data_len;
-            s_part_buf[n++] = '\r';
-            s_part_buf[n++] = '\n';
-            ret = httpd_resp_send_chunk(req, (const char *)s_part_buf, n);
-        } else {
-            ret = ESP_ERR_NO_MEM;
-        }
-        if (s_stream_ok) {
-            uvc_host_frame_return(s_stream, frame);
-        }
-    }
-
-    httpd_resp_send_chunk(req, NULL, 0);    /* 结束 chunked 响应，关闭连接 */
-    s_clients--;
-    ESP_LOGI(TAG, "Browser client left (%d watching)", s_clients);
-    return ESP_OK;
-}
-
-static httpd_handle_t start_webserver(void)
-{
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.stack_size = 12288;          /* 发大帧需要足够的任务栈 */
-    config.max_open_sockets = 5;
-    config.lru_purge_enable = true;
-
-    ESP_LOGI(TAG, "Starting HTTP server on port %d", config.server_port);
-    httpd_handle_t server = NULL;
-    if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_uri_t uri_index =    { .uri = "/",         .method = HTTP_GET, .handler = handler_index };
-        httpd_uri_t uri_stream =   { .uri = "/stream",   .method = HTTP_GET, .handler = handler_stream };
-        httpd_uri_t uri_snapshot = { .uri = "/snapshot", .method = HTTP_GET, .handler = handler_snapshot };
-        httpd_register_uri_handler(server, &uri_index);
-        httpd_register_uri_handler(server, &uri_stream);
-        httpd_register_uri_handler(server, &uri_snapshot);
-        return server;
-    }
-    return NULL;
-}
-
-/* ---------------- WiFi ---------------- */
-
-static void wifi_event_handler(void *arg, esp_event_base_t event_base,
-                               int32_t event_id, void *event_data)
-{
-    (void)arg;
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
-        ESP_LOGW(TAG, "WiFi lost, reason=%d, reconnecting ...", disc->reason);
-        esp_wifi_connect();
-        xEventGroupSetBits(s_wifi_events, WIFI_FAIL_BIT);
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *ip_event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "========================================");
-        ESP_LOGI(TAG, "  WiFi connected! IP: " IPSTR, IP2STR(&ip_event->ip_info.ip));
-        ESP_LOGI(TAG, "  Browser open: http://" IPSTR "/", IP2STR(&ip_event->ip_info.ip));
-        ESP_LOGI(TAG, "========================================");
-        xEventGroupClearBits(s_wifi_events, WIFI_FAIL_BIT);
-        xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
-    }
-}
-
-static void wifi_init(void)
-{
-    s_wifi_events = xEventGroupCreate();
-
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                                        &wifi_event_handler, NULL, NULL));
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .threshold.authmode = WIFI_AUTH_WPA_PSK,
-        },
-    };
-#if WIFI_USE_ENTERPRISE
-    /* 802.1X 企业网（Tsinghua-Secure 等）：PEAP + MSCHAPv2，学号+校园网密码 */
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_ENTERPRISE;
-    ESP_ERROR_CHECK(esp_eap_client_set_identity((const unsigned char *)EAP_IDENTITY, strlen(EAP_IDENTITY)));
-    ESP_ERROR_CHECK(esp_eap_client_set_username((const unsigned char *)EAP_USERNAME, strlen(EAP_USERNAME)));
-    ESP_ERROR_CHECK(esp_eap_client_set_password((const unsigned char *)EAP_PASSWORD, strlen(EAP_PASSWORD)));
-    ESP_ERROR_CHECK(esp_eap_client_set_eap_methods(ESP_EAP_TYPE_PEAP));
-    /* ESP32 没有 RTC 电池，上电时间是 1970 年，关掉证书时间校验避免 PEAP 因此失败 */
-    ESP_ERROR_CHECK(esp_eap_client_set_disable_time_check(true));
-    ESP_ERROR_CHECK(esp_wifi_sta_enterprise_enable());
-    ESP_LOGI(TAG, "WiFi mode: 802.1X enterprise (PEAP/MSCHAPv2), identity \"%s\"", EAP_IDENTITY);
-#else
-    strlcpy((char *)wifi_config.sta.password, WIFI_PASSWORD, sizeof(wifi_config.sta.password));
-    ESP_LOGI(TAG, "WiFi mode: WPA-PSK");
-#endif
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));     /* 关省电，否则推流吞吐掉一个数量级 */
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "Connecting to WiFi \"%s\" ...", WIFI_SSID);
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_events,
-                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(20000));
-    if (!(bits & WIFI_CONNECTED_BIT)) {
-        ESP_LOGE(TAG, "WiFi not connected yet (check SSID/password in main/wifi_credentials.h). Will keep retrying.");
-    }
-}
-
-/* ---------------- app_main ---------------- */
 
 void app_main(void)
 {
-    /* NVS：WiFi 校准数据要存这里 */
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
-    ESP_LOGI(TAG, "Installing USB Host (camera on GPIO19=D- GPIO20=D+)");
-    const usb_host_config_t host_config = {
-        .skip_phy_setup = false,
-        .intr_flags = ESP_INTR_FLAG_LOWMED,
-    };
-    ESP_ERROR_CHECK(usb_host_install(&host_config));
-    BaseType_t ok = xTaskCreatePinnedToCore(usb_lib_task, "usb_lib", 4096,
-                                            NULL, USB_HOST_PRIORITY, NULL, tskNO_AFFINITY);
-    assert(ok == pdTRUE);
-
-    const uvc_host_driver_config_t uvc_driver_config = {
-        .driver_task_stack_size = 4 * 1024,
-        .driver_task_priority = USB_HOST_PRIORITY + 1,
-        .xCoreID = tskNO_AFFINITY,
-        .create_background_task = true,
-        .event_cb = uvc_event_cb,
-    };
-    ESP_ERROR_CHECK(uvc_host_install(&uvc_driver_config));
-
+    motors_init();
+    s_gray = heap_caps_malloc(IMG_W * IMG_H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_mask = heap_caps_malloc(IMG_W * IMG_H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_queue = heap_caps_malloc(IMG_W * IMG_H * sizeof(uint32_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    assert(s_gray && s_mask && s_queue);
     s_frame_q = xQueueCreate(FRAME_BUFFERS, sizeof(uvc_host_frame_t *));
     assert(s_frame_q);
-    s_send_q = xQueueCreate(2, sizeof(uvc_host_frame_t *));
-    assert(s_send_q);
-    s_part_buf = heap_caps_malloc(PART_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    assert(s_part_buf);
-    ok = xTaskCreatePinnedToCore(frame_handling_task, "uvc_frame", 4096,
-                                 NULL, USB_HOST_PRIORITY - 2, NULL, tskNO_AFFINITY);
-    assert(ok == pdTRUE);
-
-    wifi_init();
-    start_webserver();
+    const usb_host_config_t usb_cfg = {.skip_phy_setup = false, .intr_flags = ESP_INTR_FLAG_LOWMED};
+    ESP_ERROR_CHECK(usb_host_install(&usb_cfg));
+    xTaskCreatePinnedToCore(usb_lib_task, "usb_lib", 4096, NULL, USB_PRIORITY, NULL, tskNO_AFFINITY);
+    const uvc_host_driver_config_t uvc_cfg = {
+        .driver_task_stack_size = 4096, .driver_task_priority = USB_PRIORITY + 1,
+        .xCoreID = tskNO_AFFINITY, .create_background_task = true, .event_cb = uvc_event_callback,
+    };
+    ESP_ERROR_CHECK(uvc_host_install(&uvc_cfg));
+    ESP_LOGI(TAG, "USB camera pins: GPIO19=D- GPIO20=D+; waiting for camera");
+    xTaskCreatePinnedToCore(camera_task, "camera", 6144, NULL, USB_PRIORITY - 1, NULL, 0);
 }
