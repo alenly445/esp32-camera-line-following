@@ -1,2 +1,9 @@
 .build/
 .vscode/ipch/
+test/output/
+**/__pycache__/
+*.pyc
+**/sdkconfig.old
+**/build/
+**/managed_components/
+**/main/wifi_credentials.h

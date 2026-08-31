@@ -35,6 +35,10 @@
  *   一起停，v23的防尾部偏航效果保留。
  *   另加3秒超时兜底：编码器若彻底失效（计数不动），强制结束直行。
  *
+ * [v26] 超声 TRIG/ECHO 从 19/20 迁到 6/7（红外停用）：
+ *   19/20 是 ESP32-S3 原生 USB D-/D+，让位给 USB 摄像头（JQ-CAM12-720P），
+ *   后续工程转 ESP-IDF 走 usb_host_uvc。注意：红外板若仍接在 6/7 会与超声顶牛，须先拔除。
+ *
  * 屏幕架构说明（为什么不在 loop() 里刷屏）：
  *   - [v25] ST7735 改走硬件SPI（GPIO矩阵路由到SCK=9/MOSI=1，接线不变），
  *     一帧<10ms，CPU占用相比软SPI下降一个数量级
@@ -44,7 +48,9 @@
  * 硬件接线与 v19 相同：
  *   TFT: CS=8 RST=3 DC=2 SCK=9 MOSI=1，VCC/BLK=3.3V（[v25]硬件SPI）
  *   编码器: A轮 48/47, B轮 40/39, D轮 42/41
- *   超声: TRIG=19 ECHO=20，红外: GPIO4~7，电机: 10~18/21，灯: 38
+ *   超声: TRIG=6 ECHO=7（[v26]原19/20让位给USB摄像头D-/D+）
+ *   红外: GPIO4~7（[v26]停用）；电机: 10~18/21，灯: 38
+ *   摄像头USB: D-=19 D+=20，5V/GND 接车上5V共地
  *
  * 运行方式：烧录后自动运行；RESET = 重新进入 3 秒准备期
  * ==============================================================
@@ -85,8 +91,8 @@ const int RGB_LED_PIN = 38;
 // 红闪=准备期  绿色=巡线中  橙色=丢线找线中  青色=找回确认期
 
 // ---------- HC-SR04 超声波传感器 ----------
-const uint8_t TRIG_PIN = 19;
-const uint8_t ECHO_PIN = 20;
+const uint8_t TRIG_PIN = 6;   // [v26] 19->6，19/20 让位给 USB 摄像头
+const uint8_t ECHO_PIN = 7;   // [v26] 20->7
 
 // ==================== [v15] TFT屏幕引脚 ====================
 #define TFT_CS     8
@@ -1573,7 +1579,7 @@ void setup() {
   Serial.print(" 弯道降速=");
   Serial.println(CURVE_SLOWDOWN);
   Serial.println("3 秒准备期：把车摆上黑线（探头对准线），手离开...");
-  Serial.println("超声端口: TRIG=GPIO19 ECHO=GPIO20");
+  Serial.println("超声端口: TRIG=GPIO6 ECHO=GPIO7");
   Serial.println(ultrasonicTaskResult == pdPASS
                      ? "超声后台任务: 启动成功"
                      : "超声后台任务: 启动失败，请勿运行小车");
