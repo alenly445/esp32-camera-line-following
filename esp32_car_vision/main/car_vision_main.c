@@ -37,6 +37,7 @@
 #define ROI_TOP 168
 #define NEAR_TOP 222
 #define MID_TOP 198
+#define CENTER_ERROR_DEADBAND 12
 #define MIN_COMPONENT_AREA 250
 #define CONFIRM_FRAMES 3
 #define BLIND_HOLD_FRAMES 6
@@ -46,6 +47,19 @@
 #define BASE_PWM 45
 #define HOLD_PWM 24
 #define MAX_CORRECTION 18
+#define START_BOOST_PWM 22
+#define START_BOOST_FRAMES 1
+#define TRACK_DRIVE_FRAMES 2
+#define TRACK_PAUSE_FRAMES 3
+#define CORNER_ERROR_THRESHOLD 36
+#define CORNER_BASE_PWM 32
+#define CORNER_MAX_CORRECTION 38
+#define CORNER_SEARCH_PWM 40
+#define CORNER_SEARCH_TURN_FRAMES 4
+#define CORNER_SEARCH_PAUSE_FRAMES 6
+#define CORNER_SEARCH_CYCLES 12
+#define CORNER_SEARCH_FRAMES ((CORNER_SEARCH_TURN_FRAMES + CORNER_SEARCH_PAUSE_FRAMES) * CORNER_SEARCH_CYCLES)
+#define TURN_MEMORY_ERROR 18
 
 /* Existing Arduino wiring. GPIO19/20 remain reserved for native USB camera. */
 #define STBY_PIN 10
@@ -65,7 +79,7 @@
 #define MAX_DISTANCE_CM 400.0f
 #define ULTRASONIC_TIMEOUT_US 30000
 #define ULTRASONIC_INTERVAL_MS 50
-#define OBSTACLE_TURN_MS 1200
+#define OBSTACLE_TURN_MS 600
 #define OBSTACLE_CHECK_MS 600
 #define TURN_PWM 35
 
@@ -94,6 +108,8 @@ static uint32_t s_jpeg_version;
 static SemaphoreHandle_t s_jpeg_lock;
 static SemaphoreHandle_t s_status_lock;
 static httpd_handle_t s_http_server;
+static bool s_brake_active;
+static int s_start_boost_frames;
 
 typedef struct { const uint8_t *data; size_t size, pos; } jpeg_src_t;
 typedef struct { bool found; int area, near_x, mid_x, far_x, error; } line_result_t;
@@ -196,10 +212,51 @@ static void set_motor(ledc_channel_t channel, int in1, int in2, int pwm)
 static void drive(int left, int right)
 {
     if (!MOTOR_OUTPUT_ENABLED) return;
+    if (left == 0 && right == 0) {
+        s_start_boost_frames = 0;
+        s_brake_active = false;
+    } else if (s_brake_active) {
+        s_start_boost_frames = START_BOOST_FRAMES;
+        s_brake_active = false;
+    }
+    if (s_start_boost_frames > 0) {
+        if (left) left += left > 0 ? START_BOOST_PWM : -START_BOOST_PWM;
+        if (right) right += right > 0 ? START_BOOST_PWM : -START_BOOST_PWM;
+        s_start_boost_frames--;
+    }
     gpio_set_level(STBY_PIN, left != 0 || right != 0);
     set_motor(LEDC_CHANNEL_0, AIN1_PIN, AIN2_PIN, left);
     set_motor(LEDC_CHANNEL_1, BIN1_PIN, BIN2_PIN, 0);
     set_motor(LEDC_CHANNEL_2, DIN1_PIN, DIN2_PIN, right);
+}
+
+static void brake_motor(ledc_channel_t channel, int in1, int in2)
+{
+    gpio_set_level(in1, 1);
+    gpio_set_level(in2, 1);
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, channel, 255));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, channel));
+}
+
+/* TB6612 short-brake is used only during intentional camera recognition pauses. */
+static void brake_drive(void)
+{
+    if (!MOTOR_OUTPUT_ENABLED) return;
+    s_brake_active = true;
+    gpio_set_level(STBY_PIN, 1);
+    brake_motor(LEDC_CHANNEL_0, AIN1_PIN, AIN2_PIN);
+    brake_motor(LEDC_CHANNEL_2, DIN1_PIN, DIN2_PIN);
+}
+
+/* Positive steering turns the car toward a positive image error (the right side). */
+static void drive_steering(int forward, int steering)
+{
+    drive(forward + steering, forward - steering);
+}
+
+static int steering_correction(int error, int limit)
+{
+    return clampi(error * limit / (IMG_W / 2), -limit, limit);
 }
 
 static bool read_ultrasonic(float *distance_cm)
@@ -301,7 +358,7 @@ static line_result_t detect_line(void)
 
     int best_area = 0, best_near_sum = 0, best_near_n = 0;
     int best_mid_sum = 0, best_mid_n = 0, best_far_sum = 0, best_far_n = 0;
-    for (int sy = NEAR_TOP; sy < IMG_H; ++sy) {
+    for (int sy = ROI_TOP; sy < IMG_H; ++sy) {
         for (int sx = 0; sx < IMG_W; ++sx) {
             int start = sy * IMG_W + sx;
             if (s_mask[start] != 1) continue;
@@ -320,19 +377,25 @@ static line_result_t detect_line(void)
                 if (y > ROI_TOP && s_mask[p - IMG_W] == 1) { s_mask[p - IMG_W] = 2; s_flood_queue[tail++] = p - IMG_W; }
                 if (y + 1 < IMG_H && s_mask[p + IMG_W] == 1) { s_mask[p + IMG_W] = 2; s_flood_queue[tail++] = p + IMG_W; }
             }
-            if (area > best_area) {
+            /* A candidate must be visible in the near or middle look-ahead band. */
+            if ((nn + mn) > 0 && area > best_area) {
                 best_area = area; best_near_sum = ns; best_near_n = nn;
                 best_mid_sum = ms; best_mid_n = mn; best_far_sum = fs; best_far_n = fn;
             }
         }
     }
-    if (best_area < MIN_COMPONENT_AREA || best_near_n == 0) return out;
+    if (best_area < MIN_COMPONENT_AREA) return out;
     out.found = true; out.area = best_area;
-    out.near_x = best_near_sum / best_near_n;
-    out.mid_x = best_mid_n ? best_mid_sum / best_mid_n : out.near_x;
-    out.far_x = best_far_n ? best_far_sum / best_far_n : out.mid_x;
-    int target_x = (60 * out.near_x + 25 * out.mid_x + 15 * out.far_x) / 100;
+    out.near_x = best_near_n ? best_near_sum / best_near_n : -1;
+    out.mid_x = best_mid_n ? best_mid_sum / best_mid_n : -1;
+    out.far_x = best_far_n ? best_far_sum / best_far_n : -1;
+    int weighted_x = 0, weight = 0;
+    if (out.near_x >= 0) { weighted_x += 60 * out.near_x; weight += 60; }
+    if (out.mid_x >= 0) { weighted_x += 25 * out.mid_x; weight += 25; }
+    if (out.far_x >= 0) { weighted_x += 15 * out.far_x; weight += 15; }
+    int target_x = weighted_x / weight;
     out.error = target_x - IMG_W / 2;
+    if (abs(out.error) <= CENTER_ERROR_DEADBAND) out.error = 0;
     return out;
 }
 
@@ -568,7 +631,8 @@ static void stream_callback(const uvc_host_stream_event_data_t *event, void *ctx
 static void vision_task(void *arg)
 {
     (void)arg;
-    int confirmed = 0, missing = 0, last_error = 0;
+    int confirmed = 0, missing = 0, last_error = 0, last_turn_direction = 1;
+    int search_frames = 0, track_frames = 0;
     unsigned frame_no = 0;
     while (s_connected) {
         uvc_host_frame_t *frame = NULL;
@@ -583,28 +647,65 @@ static void vision_task(void *arg)
         bool decoded = decode_jpeg(frame->data, frame->data_len);
         if (decoded) line = detect_line();
         const bool obstacle_active = handle_obstacle();
-        const char *state;
+        const char *state = "LOST_STOP";
         if (obstacle_active) {
+            track_frames = 0;
             state = s_obstacle_state == OBSTACLE_TURN ? "AVOID_TURN" : "AVOID_CHECK";
         } else {
             if (line.found) {
                 missing = 0;
+                search_frames = 0;
+                if (abs(line.error) >= TURN_MEMORY_ERROR)
+                    last_turn_direction = line.error > 0 ? 1 : -1;
                 if (confirmed < CONFIRM_FRAMES) confirmed++;
                 if (confirmed >= CONFIRM_FRAMES) {
-                    last_error = (3 * last_error + line.error) / 4;
-                    int correction = clampi(last_error * MAX_CORRECTION / (IMG_W / 2), -MAX_CORRECTION, MAX_CORRECTION);
-                    drive(BASE_PWM - correction, BASE_PWM + correction);
-                } else drive(0, 0);
+                    bool corner = abs(line.error) >= CORNER_ERROR_THRESHOLD || line.near_x < 0;
+                    last_error = corner ? (last_error + line.error) / 2
+                                        : (3 * last_error + line.error) / 4;
+                    int correction = steering_correction(last_error,
+                                                         corner ? CORNER_MAX_CORRECTION : MAX_CORRECTION);
+                    if (corner) {
+                        track_frames = 0;
+                        drive_steering(CORNER_BASE_PWM, correction);
+                        state = "CORNER_TRACK";
+                    } else {
+                        int phase = track_frames % (TRACK_DRIVE_FRAMES + TRACK_PAUSE_FRAMES);
+                        if (phase < TRACK_DRIVE_FRAMES) {
+                            drive_steering(BASE_PWM, correction);
+                            state = "TRACK";
+                        } else {
+                            brake_drive();
+                            state = "TRACK_CHECK";
+                        }
+                        track_frames++;
+                    }
+                } else {
+                    track_frames = 0;
+                    drive(0, 0);
+                }
             } else {
                 confirmed = 0;
                 missing++;
+                track_frames = 0;
                 if (missing <= BLIND_HOLD_FRAMES) {
-                    int correction = clampi(last_error * MAX_CORRECTION / (IMG_W / 2), -MAX_CORRECTION, MAX_CORRECTION);
-                    drive(HOLD_PWM - correction, HOLD_PWM + correction);
-                } else drive(0, 0);
+                    drive_steering(HOLD_PWM, steering_correction(last_error, MAX_CORRECTION));
+                    state = "BLIND_HOLD";
+                } else if (search_frames < CORNER_SEARCH_FRAMES) {
+                    int phase = search_frames % (CORNER_SEARCH_TURN_FRAMES + CORNER_SEARCH_PAUSE_FRAMES);
+                    if (phase < CORNER_SEARCH_TURN_FRAMES) {
+                        drive_steering(0, last_turn_direction * CORNER_SEARCH_PWM);
+                        state = "CORNER_TURN";
+                    } else {
+                        brake_drive();
+                        state = "CORNER_CHECK";
+                    }
+                    search_frames++;
+                } else {
+                    drive(0, 0);
+                    state = "LOST_STOP";
+                }
             }
-            state = line.found ? (confirmed >= CONFIRM_FRAMES ? "TRACK" : "CONFIRM")
-                               : (missing <= BLIND_HOLD_FRAMES ? "BLIND_HOLD" : "LOST_STOP");
+            if (line.found && confirmed < CONFIRM_FRAMES) state = "CONFIRM";
         }
         update_vision_status(decoded, &line, state);
         if (++frame_no % 5 == 0) {
