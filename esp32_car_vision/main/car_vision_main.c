@@ -47,7 +47,7 @@
 #define BASE_PWM 44
 #define HOLD_PWM 41
 #define MAX_CORRECTION 18
-#define START_BOOST_PWM 38
+#define START_BOOST_PWM 18
 #define TURN_START_BOOST_PWM 10
 #define START_BOOST_FRAMES 1
 #define TRACK_DRIVE_FRAMES 2
@@ -60,11 +60,14 @@
 #define CORNER_SEARCH_TURN_FRAMES 1
 #define CORNER_SEARCH_PAUSE_FRAMES 3
 #define CORNER_SEARCH_CYCLES 12
-#define CORNER_SEARCH_FRAMES ((CORNER_SEARCH_TURN_FRAMES + CORNER_SEARCH_PAUSE_FRAMES) * CORNER_SEARCH_CYCLES)
+#define CORNER_SEARCH_FRAMES \
+    ((CORNER_SEARCH_TURN_FRAMES + CORNER_SEARCH_PAUSE_FRAMES) * CORNER_SEARCH_CYCLES)
 #define TURN_MEMORY_ERROR 18
 #define TURN_HINT_CONFIRM_FRAMES 2
 #define TURN_APPROACH_PWM 50
-#define TURN_APPROACH_ENCODER_COUNTS 250
+#define TURN_APPROACH_ENCODER_COUNTS 200
+/* 仅供已记忆的连续转弯使用；可独立调节，不影响普通转弯。 */
+#define CONTINUOUS_TURN_APPROACH_ENCODER_COUNTS 100
 #define TURN_APPROACH_CHECK_MS 10
 #define TURN_MIN_ROTATE_FRAMES 4
 #define TURN_CANDIDATE_FRAMES 2
@@ -105,14 +108,14 @@
 #define ULTRASONIC_TIMEOUT_US 30000
 #define ULTRASONIC_INTERVAL_MS 50
 #define OBSTACLE_BRAKE_MS 800
-#define OBSTACLE_MIN_SIDE_MS 200
-#define OBSTACLE_CLEAR_EXTRA_LEFT_MS 128
+#define OBSTACLE_MIN_SIDE_MS 500
+#define OBSTACLE_CLEAR_EXTRA_LEFT_MS 150
 #define OBSTACLE_STOP_PAUSE_MS 800
 #define OBSTACLE_LATERAL_A_PWM 36
-#define OBSTACLE_LATERAL_B_PWM 54
+#define OBSTACLE_LATERAL_B_PWM 58
 #define OBSTACLE_LATERAL_D_PWM 36
 #define OBSTACLE_RIGHT_A_PWM 35
-#define OBSTACLE_RIGHT_B_PWM 50
+#define OBSTACLE_RIGHT_B_PWM 58
 #define OBSTACLE_RIGHT_D_PWM 35
 #define OBSTACLE_LATERAL_SYNC_DIVISOR 6
 #define OBSTACLE_LATERAL_SYNC_MAX 6
@@ -120,13 +123,13 @@
 #define OBSTACLE_FORWARD_A_PWM 42
 #define OBSTACLE_FORWARD_D_PWM 42
 #define OBSTACLE_FORWARD_MIN_PWM 38
-#define OBSTACLE_FORWARD_TARGET_COUNTS 2000
-#define OBSTACLE_FORWARD_TIMEOUT_MS 1000
+#define OBSTACLE_FORWARD_TARGET_COUNTS 500
+#define OBSTACLE_FORWARD_TIMEOUT_MS 2500
 #define OBSTACLE_FORWARD_SYNC_DIVISOR 8
 #define OBSTACLE_FORWARD_SYNC_MAX 14
-#define OBSTACLE_MIN_RIGHT_MS 200
-#define OBSTACLE_LINE_CONFIRM_FRAMES 3
-#define OBSTACLE_COOLDOWN_MS 1000
+#define OBSTACLE_RIGHT_MOVE_MS 1000
+#define OBSTACLE_RIGHT_STOP_MS 1000
+#define OBSTACLE_FOLLOW_AFTER_MS 1500
 
 #define FRAME_BUFFERS 3
 #define FRAME_QUEUE_DEPTH 1
@@ -172,6 +175,7 @@ static volatile int32_t s_approach_start_d;
 static volatile int32_t s_approach_delta_a;
 static volatile int32_t s_approach_delta_d;
 static volatile int s_approach_direction;
+static volatile int32_t s_approach_target_counts = TURN_APPROACH_ENCODER_COUNTS;
 static volatile bool s_approach_active;
 static volatile bool s_approach_complete;
 static portMUX_TYPE s_encoder_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -181,7 +185,9 @@ typedef struct { bool found; int area, near_x, mid_x, far_x, error; } line_resul
 typedef enum {
     OBSTACLE_NONE, OBSTACLE_BRAKE, OBSTACLE_MOVE_LEFT,
     OBSTACLE_PAUSE_TO_FORWARD, OBSTACLE_FORWARD,
-    OBSTACLE_PAUSE_TO_RIGHT, OBSTACLE_MOVE_RIGHT
+    OBSTACLE_PAUSE_TO_RIGHT, OBSTACLE_MOVE_RIGHT,
+    OBSTACLE_PAUSE_AFTER_RIGHT, OBSTACLE_FOLLOW_AFTER_RIGHT,
+    OBSTACLE_FINISHED
 } obstacle_state_t;
 typedef enum { CORNER_IDLE, CORNER_APPROACH, CORNER_ROTATE } corner_state_t;
 typedef struct {
@@ -198,14 +204,11 @@ typedef struct {
 
 static obstacle_state_t s_obstacle_state;
 static uint32_t s_obstacle_started_ms;
-static uint32_t s_obstacle_cooldown_until_ms;
 static int32_t s_obstacle_start_a, s_obstacle_start_b, s_obstacle_start_d;
 static uint8_t s_obstacle_clear_count;
 static bool s_obstacle_clear_extra_active;
 static uint32_t s_obstacle_clear_extra_started_ms;
 static uint32_t s_obstacle_pause_started_ms;
-static uint8_t s_obstacle_line_confirm_frames;
-static bool s_obstacle_saw_line_off_center;
 static vision_status_t s_vision_status = {.near_x = -1, .mid_x = -1, .far_x = -1};
 
 static void begin_obstacle(void);
@@ -397,7 +400,7 @@ static void approach_control_task(void *arg)
     while (true) {
         bool active;
         int direction;
-        int32_t encoder_a, encoder_d, start_a, start_d;
+        int32_t encoder_a, encoder_d, start_a, start_d, target_counts;
 
         portENTER_CRITICAL(&s_encoder_lock);
         active = s_approach_active;
@@ -406,6 +409,7 @@ static void approach_control_task(void *arg)
         encoder_d = s_encoder_d_count;
         start_a = s_approach_start_a;
         start_d = s_approach_start_d;
+        target_counts = s_approach_target_counts;
         portEXIT_CRITICAL(&s_encoder_lock);
 
         if (active) {
@@ -419,8 +423,8 @@ static void approach_control_task(void *arg)
             s_approach_delta_a = delta_a;
             s_approach_delta_d = delta_d;
             if (s_approach_active &&
-                delta_a >= TURN_APPROACH_ENCODER_COUNTS &&
-                delta_d >= TURN_APPROACH_ENCODER_COUNTS) {
+                delta_a >= target_counts &&
+                delta_d >= target_counts) {
                 s_approach_active = false;
                 s_approach_complete = true;
                 completed = true;
@@ -801,8 +805,6 @@ static void begin_obstacle(void)
     s_obstacle_clear_extra_active = false;
     s_obstacle_clear_extra_started_ms = 0;
     s_obstacle_pause_started_ms = 0;
-    s_obstacle_line_confirm_frames = 0;
-    s_obstacle_saw_line_off_center = false;
     portENTER_CRITICAL(&s_encoder_lock);
     s_approach_active = false;
     s_approach_complete = false;
@@ -812,12 +814,11 @@ static void begin_obstacle(void)
     ESP_LOGW(TAG, "obstacle %.1f cm; stop before moving left", s_distance_cm);
 }
 
-/* 严格按 .ino 的动作顺序避障，右移退出改为摄像头确认黑线居中。 */
-static bool handle_obstacle(const line_result_t *line, bool new_distance_sample)
+/* 右移采用固定时序：右移300ms，停车500ms，巡线500ms，然后停车。 */
+static bool handle_obstacle(bool new_distance_sample)
 {
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
     if (s_obstacle_state == OBSTACLE_NONE && new_distance_sample && s_distance_valid &&
-        now >= s_obstacle_cooldown_until_ms &&
         s_distance_cm < OBSTACLE_THRESHOLD_CM) begin_obstacle();
     if (s_obstacle_state == OBSTACLE_NONE) return false;
 
@@ -928,11 +929,9 @@ static bool handle_obstacle(const line_result_t *line, bool new_distance_sample)
             s_obstacle_start_b = s_encoder_b_count;
             s_obstacle_start_d = s_encoder_d_count;
             portEXIT_CRITICAL(&s_encoder_lock);
-            s_obstacle_line_confirm_frames = 0;
-            s_obstacle_saw_line_off_center = false;
             s_obstacle_state = OBSTACLE_MOVE_RIGHT;
             s_obstacle_started_ms = now;
-            ESP_LOGW(TAG, "avoidance: move right and search centered line");
+            ESP_LOGW(TAG, "avoidance: move right for %d ms", OBSTACLE_RIGHT_MOVE_MS);
         }
         break;
 
@@ -953,22 +952,39 @@ static bool handle_obstacle(const line_result_t *line, bool new_distance_sample)
         int a_pwm = clampi(OBSTACLE_RIGHT_A_PWM + a_corr, OBSTACLE_LATERAL_MIN_PWM, 255);
         int d_pwm = clampi(OBSTACLE_RIGHT_D_PWM + d_corr, OBSTACLE_LATERAL_MIN_PWM, 255);
         drive_three_wheels(a_pwm, OBSTACLE_RIGHT_B_PWM, -d_pwm);
-        bool centered = line && line->found && line->near_x >= 0 && line->error == 0;
-        if (!centered) {
-            s_obstacle_saw_line_off_center = true;
-            s_obstacle_line_confirm_frames = 0;
-        } else if (s_obstacle_saw_line_off_center &&
-                   now - s_obstacle_started_ms >= OBSTACLE_MIN_RIGHT_MS) {
-            if (s_obstacle_line_confirm_frames < UINT8_MAX) s_obstacle_line_confirm_frames++;
-        }
-        if (s_obstacle_line_confirm_frames >= OBSTACLE_LINE_CONFIRM_FRAMES) {
+        if (now - s_obstacle_started_ms >= OBSTACLE_RIGHT_MOVE_MS) {
             brake_drive();
-            s_obstacle_state = OBSTACLE_NONE;
-            s_obstacle_cooldown_until_ms = now + OBSTACLE_COOLDOWN_MS;
-            ESP_LOGW(TAG, "avoidance: centered line confirmed; resume line following");
+            s_obstacle_state = OBSTACLE_PAUSE_AFTER_RIGHT;
+            s_obstacle_pause_started_ms = now;
+            ESP_LOGW(TAG, "avoidance: right move complete; stop for %d ms",
+                     OBSTACLE_RIGHT_STOP_MS);
         }
         break;
     }
+
+    case OBSTACLE_PAUSE_AFTER_RIGHT:
+        brake_drive();
+        if (now - s_obstacle_pause_started_ms >= OBSTACLE_RIGHT_STOP_MS) {
+            s_obstacle_state = OBSTACLE_FOLLOW_AFTER_RIGHT;
+            s_obstacle_started_ms = now;
+            ESP_LOGW(TAG, "avoidance: resume line following for %d ms",
+                     OBSTACLE_FOLLOW_AFTER_MS);
+        }
+        break;
+
+    case OBSTACLE_FOLLOW_AFTER_RIGHT:
+        if (now - s_obstacle_started_ms >= OBSTACLE_FOLLOW_AFTER_MS) {
+            brake_drive();
+            s_obstacle_state = OBSTACLE_FINISHED;
+            ESP_LOGW(TAG, "avoidance: post-follow complete; car stopped");
+            return true;
+        }
+        /* 暂时交回原有巡线逻辑，不改变其识别、走停和转向计算。 */
+        return false;
+
+    case OBSTACLE_FINISHED:
+        brake_drive();
+        break;
     case OBSTACLE_NONE: break;
     }
     return true;
@@ -1037,7 +1053,7 @@ static void vision_task(void *arg)
         uint32_t distance_version = s_distance_version;
         bool new_distance_sample = distance_version != last_distance_version;
         last_distance_version = distance_version;
-        const bool obstacle_active = handle_obstacle(&line, new_distance_sample);
+        const bool obstacle_active = handle_obstacle(new_distance_sample);
         const char *state = "LOST_STOP";
         if (obstacle_active) {
             /* 避障运动会破坏 10 cm 距离基准，因此取消尚未完成的转弯。 */
@@ -1059,16 +1075,20 @@ static void vision_task(void *arg)
             case OBSTACLE_FORWARD: state = "AVOID_FORWARD"; break;
             case OBSTACLE_PAUSE_TO_RIGHT: state = "AVOID_PAUSE_RIGHT"; break;
             case OBSTACLE_MOVE_RIGHT: state = "AVOID_RIGHT"; break;
+            case OBSTACLE_PAUSE_AFTER_RIGHT: state = "AVOID_PAUSE_RIGHT"; break;
+            case OBSTACLE_FOLLOW_AFTER_RIGHT: state = "AVOID_FOLLOW"; break;
+            case OBSTACLE_FINISHED: state = "AVOID_FINISHED"; break;
             case OBSTACLE_NONE: state = "AVOID_DONE"; break;
             }
         } else if (corner_state == CORNER_APPROACH) {
-            int32_t encoder_a, encoder_d, approach_a, approach_d;
+            int32_t encoder_a, encoder_d, approach_a, approach_d, approach_target;
             bool approach_complete;
             portENTER_CRITICAL(&s_encoder_lock);
             encoder_a = s_encoder_a_count;
             encoder_d = s_encoder_d_count;
             approach_a = s_approach_delta_a;
             approach_d = s_approach_delta_d;
+            approach_target = s_approach_target_counts;
             approach_complete = s_approach_complete;
             if (approach_complete) s_approach_complete = false;
             portEXIT_CRITICAL(&s_encoder_lock);
@@ -1081,7 +1101,7 @@ static void vision_task(void *arg)
                          "approach state=%s enc_raw=A%ld/D%ld delta=A%ld/D%ld target=%d",
                          state, (long)encoder_a, (long)encoder_d,
                          (long)approach_a, (long)approach_d,
-                         TURN_APPROACH_ENCODER_COUNTS);
+                         (int)approach_target);
             }
             if (approach_complete) {
                 corner_state = CORNER_ROTATE;
@@ -1218,6 +1238,7 @@ static void vision_task(void *arg)
                     s_approach_delta_a = 0;
                     s_approach_delta_d = 0;
                     s_approach_direction = last_turn_direction;
+                    s_approach_target_counts = TURN_APPROACH_ENCODER_COUNTS;
                     s_approach_complete = false;
                     s_approach_active = true;
                     portEXIT_CRITICAL(&s_encoder_lock);
@@ -1235,7 +1256,6 @@ static void vision_task(void *arg)
                 if (confirmed >= CONFIRM_FRAMES) {
                     last_error = (3 * last_error + line.error) / 4;
                     int correction = steering_correction(last_error, MAX_CORRECTION);
-                    /* 直线巡线连续行驶；走停观察只保留在转弯搜索阶段。 */
                     int phase = track_frames % (TRACK_DRIVE_FRAMES + TRACK_PAUSE_FRAMES);
                     if (phase < TRACK_DRIVE_FRAMES) {
                         drive_steering(BASE_PWM, correction);
@@ -1266,6 +1286,7 @@ static void vision_task(void *arg)
                         s_approach_delta_a = 0;
                         s_approach_delta_d = 0;
                         s_approach_direction = last_turn_direction;
+                        s_approach_target_counts = CONTINUOUS_TURN_APPROACH_ENCODER_COUNTS;
                         s_approach_complete = false;
                         s_approach_active = true;
                         portEXIT_CRITICAL(&s_encoder_lock);
@@ -1276,7 +1297,7 @@ static void vision_task(void *arg)
                         ESP_LOGW(TAG,
                                  "continuous corner activated after line loss: %s; target=%d",
                                  last_turn_direction < 0 ? "LEFT" : "RIGHT",
-                                 TURN_APPROACH_ENCODER_COUNTS);
+                                 CONTINUOUS_TURN_APPROACH_ENCODER_COUNTS);
                         goto vision_frame_done;
                     }
                 }
@@ -1284,7 +1305,8 @@ static void vision_task(void *arg)
                     drive_steering(HOLD_PWM, steering_correction(last_error, MAX_CORRECTION));
                     state = "BLIND_HOLD";
                 } else if (search_frames < CORNER_SEARCH_FRAMES) {
-                    int phase = search_frames % (CORNER_SEARCH_TURN_FRAMES + CORNER_SEARCH_PAUSE_FRAMES);
+                    int phase = search_frames %
+                        (CORNER_SEARCH_TURN_FRAMES + CORNER_SEARCH_PAUSE_FRAMES);
                     if (phase < CORNER_SEARCH_TURN_FRAMES) {
                         drive_turn_steering(last_turn_direction * CORNER_SEARCH_PWM,
                                             phase == 0);
