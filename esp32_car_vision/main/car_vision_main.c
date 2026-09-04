@@ -8,7 +8,6 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
-#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -16,11 +15,6 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
-#include "esp_event.h"
-#include "esp_http_server.h"
-#include "esp_netif.h"
-#include "esp_wifi.h"
-#include "nvs_flash.h"
 #include "usb/usb_host.h"
 #include "usb/uvc_host.h"
 #include "tjpgd.h"
@@ -31,6 +25,7 @@
 #define CAM_FPS 25
 #define IMG_W 320
 #define IMG_H 240
+#define JPEG_DECODE_SCALE 1
 
 /* Vision tuning copied from the tested esp32_car_vision approach. */
 #define BLACK_THRESHOLD 110
@@ -39,6 +34,9 @@
 #define MID_TOP 198
 #define CENTER_ERROR_DEADBAND 12
 #define MIN_COMPONENT_AREA 250
+/* 转弯找新线时扩大到更远区域，并允许较小的斜线连通域。 */
+#define TURN_ROI_TOP 140
+#define TURN_MIN_COMPONENT_AREA 100
 #define CONFIRM_FRAMES 3
 #define BLIND_HOLD_FRAMES 6
 
@@ -50,24 +48,25 @@
 #define START_BOOST_PWM 18
 #define TURN_START_BOOST_PWM 10
 #define START_BOOST_FRAMES 1
-#define TRACK_DRIVE_FRAMES 2
-#define TRACK_PAUSE_FRAMES 2
+#define TRACK_DRIVE_MS 200
+#define TRACK_PAUSE_MS 150
 #define CORNER_ERROR_THRESHOLD 56
 #define CORNER_BASE_PWM 42
 #define CORNER_MAX_CORRECTION 38
 #define CORNER_SEARCH_PWM 36
 #define CORNER_ALIGN_PWM 34
-#define CORNER_SEARCH_TURN_FRAMES 1
-#define CORNER_SEARCH_PAUSE_FRAMES 3
+#define CORNER_SEARCH_TURN_MS 40
+#define CORNER_SEARCH_PAUSE_MS 300
+#define CORNER_OBSERVATION_SETTLE_MS 100
 #define CORNER_SEARCH_CYCLES 12
-#define CORNER_SEARCH_FRAMES \
-    ((CORNER_SEARCH_TURN_FRAMES + CORNER_SEARCH_PAUSE_FRAMES) * CORNER_SEARCH_CYCLES)
+#define CORNER_SEARCH_TOTAL_MS \
+    ((CORNER_SEARCH_TURN_MS + CORNER_SEARCH_PAUSE_MS) * CORNER_SEARCH_CYCLES)
 #define TURN_MEMORY_ERROR 18
 #define TURN_HINT_CONFIRM_FRAMES 2
 #define TURN_APPROACH_PWM 50
-#define TURN_APPROACH_ENCODER_COUNTS 200
+#define TURN_APPROACH_ENCODER_COUNTS 230
 /* 仅供已记忆的连续转弯使用；可独立调节，不影响普通转弯。 */
-#define CONTINUOUS_TURN_APPROACH_ENCODER_COUNTS 100
+#define CONTINUOUS_TURN_APPROACH_ENCODER_COUNTS 120
 #define TURN_APPROACH_CHECK_MS 10
 #define TURN_MIN_ROTATE_FRAMES 4
 #define TURN_CANDIDATE_FRAMES 2
@@ -112,22 +111,22 @@
 #define OBSTACLE_CLEAR_EXTRA_LEFT_MS 150
 #define OBSTACLE_STOP_PAUSE_MS 800
 #define OBSTACLE_LATERAL_A_PWM 36
-#define OBSTACLE_LATERAL_B_PWM 58
+#define OBSTACLE_LATERAL_B_PWM 65
 #define OBSTACLE_LATERAL_D_PWM 36
 #define OBSTACLE_RIGHT_A_PWM 35
-#define OBSTACLE_RIGHT_B_PWM 58
+#define OBSTACLE_RIGHT_B_PWM 62
 #define OBSTACLE_RIGHT_D_PWM 35
 #define OBSTACLE_LATERAL_SYNC_DIVISOR 6
 #define OBSTACLE_LATERAL_SYNC_MAX 6
 #define OBSTACLE_LATERAL_MIN_PWM 35
-#define OBSTACLE_FORWARD_A_PWM 42
+#define OBSTACLE_FORWARD_A_PWM 41
 #define OBSTACLE_FORWARD_D_PWM 42
 #define OBSTACLE_FORWARD_MIN_PWM 38
-#define OBSTACLE_FORWARD_TARGET_COUNTS 500
+#define OBSTACLE_FORWARD_TARGET_COUNTS 700
 #define OBSTACLE_FORWARD_TIMEOUT_MS 2500
 #define OBSTACLE_FORWARD_SYNC_DIVISOR 8
 #define OBSTACLE_FORWARD_SYNC_MAX 14
-#define OBSTACLE_RIGHT_MOVE_MS 1000
+#define OBSTACLE_RIGHT_MOVE_MS 1500
 #define OBSTACLE_RIGHT_STOP_MS 1000
 #define OBSTACLE_FOLLOW_AFTER_MS 1500
 
@@ -137,11 +136,6 @@
 #define USB_PRIORITY 15
 #define NO_FRAME_STOP_COUNT 3
 #define DISPLAY_STARTUP_DELAY_MS 300
-#define WIFI_STARTUP_DELAY_MS 500
-
-#define WIFI_AP_SSID "ESP32-CarVision"
-#define WIFI_AP_PASSWORD "linecar123"
-#define HTTP_STREAM_COPY_SIZE FRAME_SIZE
 
 static const char *TAG = "car_vision";
 static QueueHandle_t s_frame_q;
@@ -154,13 +148,6 @@ static volatile uint32_t s_distance_version;
 static uint8_t *s_gray;
 static uint8_t *s_mask;
 static uint32_t *s_flood_queue;
-static uint8_t *s_jpeg_buffers[2];
-static size_t s_jpeg_sizes[2];
-static int s_jpeg_index;
-static uint32_t s_jpeg_version;
-static SemaphoreHandle_t s_jpeg_lock;
-static SemaphoreHandle_t s_status_lock;
-static httpd_handle_t s_http_server;
 static bool s_brake_active;
 static int s_start_boost_frames;
 static int s_turn_start_boost_frames;
@@ -190,18 +177,6 @@ typedef enum {
     OBSTACLE_FINISHED
 } obstacle_state_t;
 typedef enum { CORNER_IDLE, CORNER_APPROACH, CORNER_ROTATE } corner_state_t;
-typedef struct {
-    bool decoded;
-    bool found;
-    int area;
-    int near_x;
-    int mid_x;
-    int far_x;
-    int error;
-    float distance_cm;
-    char state[24];
-} vision_status_t;
-
 static obstacle_state_t s_obstacle_state;
 static uint32_t s_obstacle_started_ms;
 static int32_t s_obstacle_start_a, s_obstacle_start_b, s_obstacle_start_d;
@@ -209,41 +184,7 @@ static uint8_t s_obstacle_clear_count;
 static bool s_obstacle_clear_extra_active;
 static uint32_t s_obstacle_clear_extra_started_ms;
 static uint32_t s_obstacle_pause_started_ms;
-static vision_status_t s_vision_status = {.near_x = -1, .mid_x = -1, .far_x = -1};
-
 static void begin_obstacle(void);
-
-static void publish_jpeg(const uvc_host_frame_t *frame)
-{
-    if (!frame || !frame->data || frame->data_len < 4 || frame->data_len > FRAME_SIZE ||
-        frame->data[0] != 0xff || frame->data[1] != 0xd8 ||
-        frame->data[frame->data_len - 2] != 0xff || frame->data[frame->data_len - 1] != 0xd9) {
-        return;
-    }
-
-    if (xSemaphoreTake(s_jpeg_lock, pdMS_TO_TICKS(10)) != pdPASS) return;
-    int next = s_jpeg_index ^ 1;
-    memcpy(s_jpeg_buffers[next], frame->data, frame->data_len);
-    s_jpeg_sizes[next] = frame->data_len;
-    s_jpeg_index = next;
-    s_jpeg_version++;
-    xSemaphoreGive(s_jpeg_lock);
-}
-
-static void update_vision_status(bool decoded, const line_result_t *line, const char *state)
-{
-    if (xSemaphoreTake(s_status_lock, pdMS_TO_TICKS(10)) != pdPASS) return;
-    s_vision_status.decoded = decoded;
-    s_vision_status.found = line && line->found;
-    s_vision_status.area = line ? line->area : 0;
-    s_vision_status.near_x = line ? line->near_x : -1;
-    s_vision_status.mid_x = line ? line->mid_x : -1;
-    s_vision_status.far_x = line ? line->far_x : -1;
-    s_vision_status.error = line && line->found ? line->error : 0;
-    s_vision_status.distance_cm = s_distance_cm;
-    snprintf(s_vision_status.state, sizeof(s_vision_status.state), "%s", state);
-    xSemaphoreGive(s_status_lock);
-}
 
 static int clampi(int value, int low, int high)
 {
@@ -503,6 +444,7 @@ static void ultrasonic_task(void *arg)
         s_distance_valid = valid > 0;
         s_distance_cm = valid ? total / valid : MAX_DISTANCE_CM;
         s_distance_version++;
+        car_display_set_distance(s_distance_cm, s_distance_valid);
 
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
         if (now_ms - last_log_ms >= 500) {
@@ -548,20 +490,24 @@ static bool decode_jpeg(const uint8_t *data, size_t size)
     memset(s_gray, 255, IMG_W * IMG_H);
     if (jd_prepare(&decoder, jpeg_input, work, sizeof(work), &source) != JDR_OK) return false;
     if (decoder.width != CAM_W || decoder.height != CAM_H) return false;
-    return jd_decomp(&decoder, jpeg_output, 1) == JDR_OK;
+    /* 摄像头只提供已验证的640x480模式，解码时缩小一半供320x240检测使用。 */
+    return jd_decomp(&decoder, jpeg_output, JPEG_DECODE_SCALE) == JDR_OK;
 }
 
-static line_result_t detect_line(void)
+static line_result_t detect_line(bool turn_search)
 {
     line_result_t out = {.near_x = -1, .mid_x = -1, .far_x = -1};
+    int roi_top = turn_search ? TURN_ROI_TOP : ROI_TOP;
+    int min_component_area = turn_search ? TURN_MIN_COMPONENT_AREA
+                                         : MIN_COMPONENT_AREA;
     memset(s_mask, 0, IMG_W * IMG_H);
-    for (int y = ROI_TOP; y < IMG_H; ++y)
+    for (int y = roi_top; y < IMG_H; ++y)
         for (int x = 0; x < IMG_W; ++x)
             s_mask[y * IMG_W + x] = s_gray[y * IMG_W + x] < BLACK_THRESHOLD;
 
     int best_area = 0, best_near_sum = 0, best_near_n = 0;
     int best_mid_sum = 0, best_mid_n = 0, best_far_sum = 0, best_far_n = 0;
-    for (int sy = ROI_TOP; sy < IMG_H; ++sy) {
+    for (int sy = roi_top; sy < IMG_H; ++sy) {
         for (int sx = 0; sx < IMG_W; ++sx) {
             int start = sy * IMG_W + sx;
             if (s_mask[start] != 1) continue;
@@ -577,17 +523,40 @@ static line_result_t detect_line(void)
                 else { fs += x; fn++; }
                 if (x > 0 && s_mask[p - 1] == 1) { s_mask[p - 1] = 2; s_flood_queue[tail++] = p - 1; }
                 if (x + 1 < IMG_W && s_mask[p + 1] == 1) { s_mask[p + 1] = 2; s_flood_queue[tail++] = p + 1; }
-                if (y > ROI_TOP && s_mask[p - IMG_W] == 1) { s_mask[p - IMG_W] = 2; s_flood_queue[tail++] = p - IMG_W; }
+                if (y > roi_top && s_mask[p - IMG_W] == 1) { s_mask[p - IMG_W] = 2; s_flood_queue[tail++] = p - IMG_W; }
                 if (y + 1 < IMG_H && s_mask[p + IMG_W] == 1) { s_mask[p + IMG_W] = 2; s_flood_queue[tail++] = p + IMG_W; }
+
+                /* 转弯搜索使用八邻域，把压缩或透视造成的对角斜线连接起来。 */
+                if (turn_search) {
+                    if (x > 0 && y > roi_top && s_mask[p - IMG_W - 1] == 1) {
+                        s_mask[p - IMG_W - 1] = 2;
+                        s_flood_queue[tail++] = p - IMG_W - 1;
+                    }
+                    if (x + 1 < IMG_W && y > roi_top &&
+                        s_mask[p - IMG_W + 1] == 1) {
+                        s_mask[p - IMG_W + 1] = 2;
+                        s_flood_queue[tail++] = p - IMG_W + 1;
+                    }
+                    if (x > 0 && y + 1 < IMG_H && s_mask[p + IMG_W - 1] == 1) {
+                        s_mask[p + IMG_W - 1] = 2;
+                        s_flood_queue[tail++] = p + IMG_W - 1;
+                    }
+                    if (x + 1 < IMG_W && y + 1 < IMG_H &&
+                        s_mask[p + IMG_W + 1] == 1) {
+                        s_mask[p + IMG_W + 1] = 2;
+                        s_flood_queue[tail++] = p + IMG_W + 1;
+                    }
+                }
             }
-            /* A candidate must be visible in the near or middle look-ahead band. */
-            if ((nn + mn) > 0 && area > best_area) {
+            /* 普通巡线要求进入近/中段；转弯时远段单独出现也可成为候选。 */
+            bool valid_band = turn_search ? (nn + mn + fn) > 0 : (nn + mn) > 0;
+            if (valid_band && area > best_area) {
                 best_area = area; best_near_sum = ns; best_near_n = nn;
                 best_mid_sum = ms; best_mid_n = mn; best_far_sum = fs; best_far_n = fn;
             }
         }
     }
-    if (best_area < MIN_COMPONENT_AREA) return out;
+    if (best_area < min_component_area) return out;
     out.found = true; out.area = best_area;
     out.near_x = best_near_n ? best_near_sum / best_near_n : -1;
     out.mid_x = best_mid_n ? best_mid_sum / best_mid_n : -1;
@@ -606,7 +575,17 @@ static line_result_t detect_line(void)
 static car_display_state_t display_state_from_navigation(const char *state,
                                                          const line_result_t *line)
 {
+    if (strcmp(state, "AVOID_BRAKE") == 0) return CAR_DISPLAY_OBS_BRAKE;
     if (strcmp(state, "AVOID_LEFT") == 0) return CAR_DISPLAY_MOVE_LEFT;
+    if (strcmp(state, "AVOID_PAUSE_FORWARD") == 0)
+        return CAR_DISPLAY_PAUSE_FORWARD;
+    if (strcmp(state, "AVOID_FORWARD") == 0) return CAR_DISPLAY_PASS_OBSTACLE;
+    if (strcmp(state, "AVOID_PAUSE_RIGHT") == 0)
+        return CAR_DISPLAY_PAUSE_RIGHT;
+    if (strcmp(state, "AVOID_RIGHT") == 0) return CAR_DISPLAY_MOVE_RIGHT;
+    if (strcmp(state, "AVOID_FOLLOW") == 0) return CAR_DISPLAY_PASS_OBSTACLE;
+    if (strcmp(state, "AVOID_FINISHED") == 0)
+        return CAR_DISPLAY_AVOID_FINISHED;
     if (strcmp(state, "PEND_LEFT") == 0)
         return line->found ? CAR_DISPLAY_DETECTED_LEFT : CAR_DISPLAY_LOST_FORWARD;
     if (strcmp(state, "PEND_RIGHT") == 0)
@@ -621,6 +600,7 @@ static car_display_state_t display_state_from_navigation(const char *state,
     return CAR_DISPLAY_STRAIGHT;
 }
 
+#if 0 /* 已删除Wi-Fi网页串流功能；保留旧实现仅供历史对照，不参与编译。 */
 static esp_err_t root_handler(httpd_req_t *req)
 {
     static const char page[] =
@@ -795,6 +775,7 @@ static void start_web_server(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &stream));
     ESP_LOGI(TAG, "open http://192.168.4.1 after joining Wi-Fi %s", WIFI_AP_SSID);
 }
+#endif
 
 static void begin_obstacle(void)
 {
@@ -814,7 +795,7 @@ static void begin_obstacle(void)
     ESP_LOGW(TAG, "obstacle %.1f cm; stop before moving left", s_distance_cm);
 }
 
-/* 右移采用固定时序：右移300ms，停车500ms，巡线500ms，然后停车。 */
+/* 右移采用固定时序：右移、停车、短时巡线，然后停车。 */
 static bool handle_obstacle(bool new_distance_sample)
 {
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
@@ -907,8 +888,10 @@ static bool handle_obstacle(bool new_distance_sample)
         if (d < 0) d = 0;
         int correction = clampi((int)(d - a) / OBSTACLE_FORWARD_SYNC_DIVISOR,
                                 -OBSTACLE_FORWARD_SYNC_MAX, OBSTACLE_FORWARD_SYNC_MAX);
-        int a_pwm = clampi(OBSTACLE_FORWARD_A_PWM + correction, OBSTACLE_FORWARD_MIN_PWM, 255);
-        int d_pwm = clampi(OBSTACLE_FORWARD_D_PWM - correction, OBSTACLE_FORWARD_MIN_PWM, 255);
+        int a_pwm = clampi(OBSTACLE_FORWARD_A_PWM + correction,
+                           OBSTACLE_FORWARD_MIN_PWM, 255);
+        int d_pwm = clampi(OBSTACLE_FORWARD_D_PWM - correction,
+                           OBSTACLE_FORWARD_MIN_PWM, 255);
         drive_three_wheels(a_pwm, 0, d_pwm);
         if ((a >= OBSTACLE_FORWARD_TARGET_COUNTS && d >= OBSTACLE_FORWARD_TARGET_COUNTS) ||
             now - s_obstacle_started_ms >= OBSTACLE_FORWARD_TIMEOUT_MS) {
@@ -1018,17 +1001,25 @@ static void vision_task(void *arg)
 {
     (void)arg;
     int confirmed = 0, missing = 0, last_error = 0, last_turn_direction = 1;
-    int search_frames = 0, track_frames = 0;
-    int hint_direction = 0, hint_frames = 0, rotate_frames = 0, reacquire_frames = 0;
+    int hint_direction = 0, hint_frames = 0, reacquire_frames = 0;
     int candidate_frames = 0, candidate_miss_frames = 0;
     int next_turn_direction = 0, next_turn_confirm_frames = 0;
     int post_turn_frames = 0, post_turn_missing_frames = 0;
     bool new_line_candidate = false;
     bool next_turn_valid = false, post_turn_active = false;
+    /* 每次上电后的首个弯道使用普通approach距离；成功完成后统一使用后续距离。 */
+    bool first_turn_completed = false;
+    bool track_driving = true;
+    bool corner_driving = true;
+    bool search_active = false, search_driving = true;
+    uint32_t track_phase_started_ms = 0;
+    uint32_t corner_phase_started_ms = 0;
+    uint32_t search_started_ms = 0, search_phase_started_ms = 0;
     corner_state_t corner_state = CORNER_IDLE;
     unsigned frame_no = 0;
     uint32_t last_distance_version = 0;
     int no_frame_count = 0;
+    int64_t previous_frame_started_us = 0;
     while (s_connected) {
         uvc_host_frame_t *frame = NULL;
         if (xQueueReceive(s_frame_q, &frame, pdMS_TO_TICKS(500)) != pdPASS) {
@@ -1041,20 +1032,33 @@ static void vision_task(void *arg)
                 portEXIT_CRITICAL(&s_encoder_lock);
                 drive(0, 0);
             }
-            update_vision_status(false, NULL, "NO_FRAME");
             continue;
         }
         no_frame_count = 0;
-        publish_jpeg(frame);
-
+        int64_t frame_started_us = esp_timer_get_time();
+        uint32_t frame_gap_ms = previous_frame_started_us > 0
+                                    ? (uint32_t)((frame_started_us - previous_frame_started_us) / 1000)
+                                    : 0;
+        previous_frame_started_us = frame_started_us;
         line_result_t line = {.near_x = -1, .mid_x = -1, .far_x = -1};
+        int64_t decode_started_us = esp_timer_get_time();
         bool decoded = decode_jpeg(frame->data, frame->data_len);
-        if (decoded) line = detect_line();
+        uint32_t decode_ms = (uint32_t)((esp_timer_get_time() - decode_started_us) / 1000);
+        uint32_t detect_ms = 0;
+        if (decoded) {
+            int64_t detect_started_us = esp_timer_get_time();
+            line = detect_line(corner_state == CORNER_ROTATE);
+            detect_ms = (uint32_t)((esp_timer_get_time() - detect_started_us) / 1000);
+        }
+        uint32_t control_now_ms = (uint32_t)(esp_timer_get_time() / 1000);
         uint32_t distance_version = s_distance_version;
         bool new_distance_sample = distance_version != last_distance_version;
         last_distance_version = distance_version;
         const bool obstacle_active = handle_obstacle(new_distance_sample);
         const char *state = "LOST_STOP";
+        bool debug_turn_observing = false;
+        bool debug_turn_settled = false;
+        bool debug_reacquire_match = false;
         if (obstacle_active) {
             /* 避障运动会破坏 10 cm 距离基准，因此取消尚未完成的转弯。 */
             corner_state = CORNER_IDLE;
@@ -1067,7 +1071,8 @@ static void vision_task(void *arg)
             next_turn_confirm_frames = 0;
             next_turn_valid = false;
             post_turn_active = false;
-            track_frames = 0;
+            track_phase_started_ms = 0;
+            search_active = false;
             switch (s_obstacle_state) {
             case OBSTACLE_BRAKE: state = "AVOID_BRAKE"; break;
             case OBSTACLE_MOVE_LEFT: state = "AVOID_LEFT"; break;
@@ -1105,7 +1110,8 @@ static void vision_task(void *arg)
             }
             if (approach_complete) {
                 corner_state = CORNER_ROTATE;
-                rotate_frames = 0;
+                corner_driving = true;
+                corner_phase_started_ms = control_now_ms;
                 reacquire_frames = 0;
                 candidate_frames = 0;
                 candidate_miss_frames = 0;
@@ -1117,30 +1123,41 @@ static void vision_task(void *arg)
                 state = last_turn_direction < 0 ? "TURN_LEFT" : "TURN_RIGHT";
             }
         } else if (corner_state == CORNER_ROTATE) {
-            /* 至少先旋转数帧，再允许画面中的旧线路触发重新捕获。 */
-            int phase_length = CORNER_SEARCH_TURN_FRAMES + CORNER_SEARCH_PAUSE_FRAMES;
-            int phase = rotate_frames % phase_length;
-            bool observing = phase >= CORNER_SEARCH_TURN_FRAMES;
-            bool observation_settled = phase > CORNER_SEARCH_TURN_FRAMES;
+            /* 原地转弯使用毫秒节拍，与摄像头实际帧率无关。 */
+            uint32_t corner_phase_elapsed = control_now_ms - corner_phase_started_ms;
+            if (corner_driving && corner_phase_elapsed >= CORNER_SEARCH_TURN_MS) {
+                corner_driving = false;
+                corner_phase_started_ms = control_now_ms;
+                corner_phase_elapsed = 0;
+                brake_drive();
+            }
+            bool observing = !corner_driving;
+            bool observation_settled = observing &&
+                corner_phase_elapsed >= CORNER_OBSERVATION_SETTLE_MS;
+            bool observation_pause_complete = observing &&
+                corner_phase_elapsed >= CORNER_SEARCH_PAUSE_MS;
+            debug_turn_observing = observing;
+            debug_turn_settled = observation_settled;
 
             /* 不设置转弯超时：未重新识别到黑线时持续执行“旋转—停车观察”。 */
             if (!observing) {
                 int turn_pwm = new_line_candidate ? CORNER_ALIGN_PWM : CORNER_SEARCH_PWM;
-                drive_turn_steering(last_turn_direction * turn_pwm, phase == 0);
+                drive_turn_steering(last_turn_direction * turn_pwm,
+                                    corner_phase_elapsed == 0);
                 state = new_line_candidate
                             ? (last_turn_direction < 0 ? "TURN_ALIGN_LEFT" : "TURN_ALIGN_RIGHT")
                             : (last_turn_direction < 0 ? "TURN_LEFT" : "TURN_RIGHT");
-                reacquire_frames = 0;
-                rotate_frames++;
+                /* 驱动帧不是视觉否定证据，不清零已累计的稳定观察结果。 */
             } else {
-                /* 停车后的第一帧只用于消除运动模糊，后续帧才判断新线。 */
-                if (phase == CORNER_SEARCH_TURN_FRAMES) brake_drive();
-                else drive(0, 0);
+                /* 停车后先等待固定毫秒消除运动模糊，再使用视觉帧判断新线。 */
+                drive(0, 0);
                 state = last_turn_direction < 0 ? "TURN_CHECK_LEFT" : "TURN_CHECK_RIGHT";
 
                 if (observation_settled) {
                     bool candidate_visible = line.found &&
-                                             (line.near_x >= 0 || line.mid_x >= 0);
+                                             (line.near_x >= 0 ||
+                                              line.mid_x >= 0 ||
+                                              line.far_x >= 0);
                     if (candidate_visible) {
                         candidate_frames++;
                         candidate_miss_frames = 0;
@@ -1155,8 +1172,11 @@ static void vision_task(void *arg)
                         candidate_miss_frames = 0;
                     }
 
-                    if (new_line_candidate && line.found && line.near_x >= 0 &&
-                        abs(line.error) <= TURN_REACQUIRE_ERROR)
+                    /* 最终退出旋转必须看到近段黑线，防止远处支路或旧线提前结束转弯。 */
+                    debug_reacquire_match = new_line_candidate && line.found &&
+                        line.near_x >= 0 &&
+                        abs(line.error) <= TURN_REACQUIRE_ERROR;
+                    if (debug_reacquire_match)
                         reacquire_frames++;
                     else
                         reacquire_frames = 0;
@@ -1187,11 +1207,11 @@ static void vision_task(void *arg)
                         }
                     }
                 }
-                rotate_frames++;
             }
 
             if (reacquire_frames >= TURN_REACQUIRE_FRAMES) {
                 corner_state = CORNER_IDLE;
+                first_turn_completed = true;
                 confirmed = CONFIRM_FRAMES;
                 missing = 0;
                 last_error = line.error;
@@ -1204,11 +1224,22 @@ static void vision_task(void *arg)
                 ESP_LOGW(TAG, "new path reacquired; resume line following; next=%s",
                          next_turn_valid ? (next_turn_direction < 0 ? "LEFT" : "RIGHT")
                                          : "NONE");
+            } else if (observation_pause_complete) {
+                /* 当前稳定帧已经完成视觉判断，再启动下一次旋转脉冲。 */
+                /* 新线确认必须在同一次停车观察窗口完成，不跨旋转周期累计。 */
+                reacquire_frames = 0;
+                corner_driving = true;
+                corner_phase_started_ms = control_now_ms;
+                int turn_pwm = new_line_candidate ? CORNER_ALIGN_PWM : CORNER_SEARCH_PWM;
+                drive_turn_steering(last_turn_direction * turn_pwm, true);
+                state = new_line_candidate
+                            ? (last_turn_direction < 0 ? "TURN_ALIGN_LEFT" : "TURN_ALIGN_RIGHT")
+                            : (last_turn_direction < 0 ? "TURN_LEFT" : "TURN_RIGHT");
             }
         } else {
             if (line.found) {
                 missing = 0;
-                search_frames = 0;
+                search_active = false;
                 if (post_turn_active) {
                     post_turn_missing_frames = 0;
                     post_turn_frames++;
@@ -1238,41 +1269,55 @@ static void vision_task(void *arg)
                     s_approach_delta_a = 0;
                     s_approach_delta_d = 0;
                     s_approach_direction = last_turn_direction;
-                    s_approach_target_counts = TURN_APPROACH_ENCODER_COUNTS;
+                    int32_t approach_target = first_turn_completed
+                                                ? CONTINUOUS_TURN_APPROACH_ENCODER_COUNTS
+                                                : TURN_APPROACH_ENCODER_COUNTS;
+                    s_approach_target_counts = approach_target;
                     s_approach_complete = false;
                     s_approach_active = true;
                     portEXIT_CRITICAL(&s_encoder_lock);
                     corner_state = CORNER_APPROACH;
                     hint_frames = 0;
-                    track_frames = 0;
+                    track_phase_started_ms = 0;
                     drive_without_boost(TURN_APPROACH_PWM, TURN_APPROACH_PWM);
                     state = last_turn_direction < 0 ? "PEND_LEFT" : "PEND_RIGHT";
                     ESP_LOGW(TAG, "corner memorized: %s; approach target A/D=%d",
                              last_turn_direction < 0 ? "LEFT" : "RIGHT",
-                             TURN_APPROACH_ENCODER_COUNTS);
+                             (int)approach_target);
                     goto vision_frame_done;
                 }
                 if (confirmed < CONFIRM_FRAMES) confirmed++;
                 if (confirmed >= CONFIRM_FRAMES) {
                     last_error = (3 * last_error + line.error) / 4;
                     int correction = steering_correction(last_error, MAX_CORRECTION);
-                    int phase = track_frames % (TRACK_DRIVE_FRAMES + TRACK_PAUSE_FRAMES);
-                    if (phase < TRACK_DRIVE_FRAMES) {
+                    /* 直线走停使用毫秒节拍，不随摄像头帧率变化。 */
+                    if (track_phase_started_ms == 0) {
+                        track_driving = true;
+                        track_phase_started_ms = control_now_ms;
+                    }
+                    uint32_t track_elapsed = control_now_ms - track_phase_started_ms;
+                    if (track_driving && track_elapsed >= TRACK_DRIVE_MS) {
+                        track_driving = false;
+                        track_phase_started_ms = control_now_ms;
+                    } else if (!track_driving && track_elapsed >= TRACK_PAUSE_MS) {
+                        track_driving = true;
+                        track_phase_started_ms = control_now_ms;
+                    }
+                    if (track_driving) {
                         drive_steering(BASE_PWM, correction);
                         state = "TRACK";
                     } else {
                         brake_drive();
                         state = "TRACK_CHECK";
                     }
-                    track_frames++;
                 } else {
-                    track_frames = 0;
+                    track_phase_started_ms = 0;
                     drive(0, 0);
                 }
             } else {
                 confirmed = 0;
                 missing++;
-                track_frames = 0;
+                track_phase_started_ms = 0;
                 if (post_turn_active && next_turn_valid && decoded) {
                     post_turn_missing_frames++;
                     if (post_turn_missing_frames >= NEXT_TURN_LOST_FRAMES) {
@@ -1302,35 +1347,67 @@ static void vision_task(void *arg)
                     }
                 }
                 if (missing <= BLIND_HOLD_FRAMES) {
+                    search_active = false;
                     drive_steering(HOLD_PWM, steering_correction(last_error, MAX_CORRECTION));
                     state = "BLIND_HOLD";
-                } else if (search_frames < CORNER_SEARCH_FRAMES) {
-                    int phase = search_frames %
-                        (CORNER_SEARCH_TURN_FRAMES + CORNER_SEARCH_PAUSE_FRAMES);
-                    if (phase < CORNER_SEARCH_TURN_FRAMES) {
+                } else {
+                    if (!search_active) {
+                        search_active = true;
+                        search_driving = true;
+                        search_started_ms = control_now_ms;
+                        search_phase_started_ms = control_now_ms;
+                    }
+                    uint32_t search_total_elapsed = control_now_ms - search_started_ms;
+                    uint32_t search_phase_elapsed = control_now_ms - search_phase_started_ms;
+                    if (search_driving && search_phase_elapsed >= CORNER_SEARCH_TURN_MS) {
+                        search_driving = false;
+                        search_phase_started_ms = control_now_ms;
+                    } else if (!search_driving &&
+                               search_phase_elapsed >= CORNER_SEARCH_PAUSE_MS) {
+                        search_driving = true;
+                        search_phase_started_ms = control_now_ms;
+                    }
+                    if (search_total_elapsed >= CORNER_SEARCH_TOTAL_MS) {
+                        drive(0, 0);
+                        state = "LOST_STOP";
+                    } else if (search_driving) {
                         drive_turn_steering(last_turn_direction * CORNER_SEARCH_PWM,
-                                            phase == 0);
+                                            search_phase_elapsed == 0);
                         state = "CORNER_TURN";
                     } else {
                         brake_drive();
                         state = "CORNER_CHECK";
                     }
-                    search_frames++;
-                } else {
-                    drive(0, 0);
-                    state = "LOST_STOP";
                 }
             }
             if (line.found && confirmed < CONFIRM_FRAMES) state = "CONFIRM";
         }
 vision_frame_done:
-        update_vision_status(decoded, &line, state);
+        int32_t display_encoder_a, display_encoder_d;
+        portENTER_CRITICAL(&s_encoder_lock);
+        display_encoder_a = s_encoder_a_count;
+        display_encoder_d = s_encoder_d_count;
+        portEXIT_CRITICAL(&s_encoder_lock);
+        car_display_set_encoders(display_encoder_a, display_encoder_d);
         car_display_set(s_command_left_pwm, s_command_back_pwm, s_command_right_pwm,
                         display_state_from_navigation(state, &line));
-        if (++frame_no % 5 == 0) {
-            ESP_LOGI(TAG, "state=%s decode=%d area=%d x=%d/%d/%d error=%d distance=%.1f motor=%s",
+        uint32_t frame_total_ms =
+            (uint32_t)((esp_timer_get_time() - frame_started_us) / 1000);
+        if (++frame_no % 5 == 0 || debug_turn_settled) {
+            ESP_LOGI(TAG, "state=%s decode=%d area=%d x=%d/%d/%d error=%d "
+                     "turn_obs=%d settled=%d cand=%d/%d lock=%d miss=%d "
+                     "match=%d reacq=%d/%d perf=gap%u/decode%u/detect%u/total%ums "
+                     "distance=%.1f motor=%s",
                      state, decoded, line.area, line.near_x, line.mid_x, line.far_x,
-                     line.found ? line.error : last_error, s_distance_cm,
+                     line.found ? line.error : last_error,
+                     debug_turn_observing, debug_turn_settled,
+                     candidate_frames, TURN_CANDIDATE_FRAMES,
+                     new_line_candidate, candidate_miss_frames,
+                     debug_reacquire_match,
+                     reacquire_frames, TURN_REACQUIRE_FRAMES,
+                     (unsigned)frame_gap_ms, (unsigned)decode_ms,
+                     (unsigned)detect_ms, (unsigned)frame_total_ms,
+                     s_distance_cm,
                      MOTOR_OUTPUT_ENABLED ? "ON" : "DRY");
         }
         uvc_host_frame_return(s_stream, frame);
@@ -1462,17 +1539,10 @@ void app_main(void)
     s_gray = heap_caps_malloc(IMG_W * IMG_H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_mask = heap_caps_malloc(IMG_W * IMG_H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_flood_queue = heap_caps_malloc(IMG_W * IMG_H * sizeof(uint32_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    s_jpeg_buffers[0] = heap_caps_malloc(FRAME_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    s_jpeg_buffers[1] = heap_caps_malloc(FRAME_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    s_jpeg_lock = xSemaphoreCreateMutex();
-    s_status_lock = xSemaphoreCreateMutex();
-    assert(s_gray && s_mask && s_flood_queue && s_jpeg_buffers[0] && s_jpeg_buffers[1] &&
-           s_jpeg_lock && s_status_lock);
+    assert(s_gray && s_mask && s_flood_queue);
     /* 只积压一帧，处理不完的新帧立即归还给 UVC，避免缓冲耗尽。 */
     s_frame_q = xQueueCreate(FRAME_QUEUE_DEPTH, sizeof(uvc_host_frame_t *));
     assert(s_frame_q);
-
-    update_vision_status(false, NULL, "BOOT");
 
     const usb_host_config_t usb_cfg = {.skip_phy_setup = false, .intr_flags = ESP_INTR_FLAG_LOWMED};
     ESP_ERROR_CHECK(usb_host_install(&usb_cfg));
@@ -1489,8 +1559,4 @@ void app_main(void)
              TRIG_PIN, ECHO_PIN);
     xTaskCreatePinnedToCore(camera_task, "camera", 6144, NULL, USB_PRIORITY - 1, NULL, 0);
 
-    /* USB Host先获得启动时间，避免摄像头与Wi-Fi同时产生电流尖峰。 */
-    vTaskDelay(pdMS_TO_TICKS(WIFI_STARTUP_DELAY_MS));
-    //wifi_start_ap();
-    //start_web_server();
 }

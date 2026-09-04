@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -19,10 +20,7 @@
 #define TFT_RST_PIN 3
 #define TFT_WIDTH 160
 #define TFT_HEIGHT 128
-#define DISPLAY_POLL_MS 20
-#define DISPLAY_MIN_REFRESH_MS 250
-#define DISPLAY_FORCE_REFRESH_MS 2000
-#define DISPLAY_PWM_CHANGE 3
+#define TFT_REFRESH_MS 50
 #define NEW_LINE_HOLD_MS 700
 
 #define RGB565(r, g, b) (uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3))
@@ -40,6 +38,10 @@ static volatile int s_left_pwm;
 static volatile int s_back_pwm;
 static volatile int s_right_pwm;
 static volatile car_display_state_t s_state = CAR_DISPLAY_STOP;
+static volatile float s_distance_cm;
+static volatile bool s_distance_valid;
+static volatile int32_t s_encoder_a;
+static volatile int32_t s_encoder_d;
 static volatile TickType_t s_new_line_tick;
 static esp_err_t s_spi_error = ESP_OK;
 
@@ -168,6 +170,66 @@ static void fill_rect(int x, int y, int width, int height, uint16_t color)
     }
 }
 
+/* 3x5紧凑字模，每个点放大为2x2；比Arduino默认1号字更醒目。 */
+static const char *glyph_3x5(char c)
+{
+    switch (c) {
+    case '0': return "111101101101111"; case '1': return "010110010010111";
+    case '2': return "111001111100111"; case '3': return "111001111001111";
+    case '4': return "101101111001001"; case '5': return "111100111001111";
+    case '6': return "111100111101111"; case '7': return "111001010010010";
+    case '8': return "111101111101111"; case '9': return "111101111001111";
+    case 'A': return "010101111101101"; case 'B': return "110101110101110";
+    case 'C': return "111100100100111"; case 'D': return "110101101101110";
+    case 'E': return "111100110100111"; case 'F': return "111100110100100";
+    case 'G': return "111100101101111"; case 'H': return "101101111101101";
+    case 'I': return "111010010010111"; case 'J': return "001001001101111";
+    case 'K': return "101101110101101"; case 'L': return "100100100100111";
+    case 'M': return "101111111101101"; case 'N': return "101111111111101";
+    case 'O': return "111101101101111"; case 'P': return "111101111100100";
+    case 'Q': return "111101101111001"; case 'R': return "110101110101101";
+    case 'S': return "111100111001111"; case 'T': return "111010010010010";
+    case 'U': return "101101101101111"; case 'V': return "101101101101010";
+    case 'W': return "101101111111101"; case 'X': return "101101010101101";
+    case 'Y': return "101101010010010"; case 'Z': return "111001010100111";
+    case ':': return "000010000010000"; case '-': return "000000111000000";
+    case '>': return "100010001010100"; case '/': return "001001010100100";
+    default: return "000000000000000";
+    }
+}
+
+static void draw_text_large(int x, int y, const char *text, uint16_t color)
+{
+    for (; *text && x <= TFT_WIDTH - 6; ++text, x += 8) {
+        const char *bits = glyph_3x5(*text);
+        for (int row = 0; row < 5; ++row)
+            for (int column = 0; column < 3; ++column)
+                if (bits[row * 3 + column] == '1')
+                    fill_rect(x + column * 2, y + row * 2, 2, 2, color);
+    }
+}
+
+static const char *display_state_name(car_display_state_t state)
+{
+    switch (state) {
+    case CAR_DISPLAY_DETECTED_LEFT: return "PEND-LEFT";
+    case CAR_DISPLAY_DETECTED_RIGHT: return "PEND-RIGHT";
+    case CAR_DISPLAY_LOST_FORWARD: return "LOST";
+    case CAR_DISPLAY_TURNING_LEFT: return "TURN-LEFT";
+    case CAR_DISPLAY_TURNING_RIGHT: return "TURN-RIGHT";
+    case CAR_DISPLAY_NEW_LINE: return "REACQUIRE";
+    case CAR_DISPLAY_MOVE_LEFT: return "MOVE-LEFT";
+    case CAR_DISPLAY_OBS_BRAKE: return "OBS-BRAKE";
+    case CAR_DISPLAY_PAUSE_FORWARD: return "PAUSE-FWD";
+    case CAR_DISPLAY_PASS_OBSTACLE: return "PASS-OBS";
+    case CAR_DISPLAY_PAUSE_RIGHT: return "PAUSE-RT";
+    case CAR_DISPLAY_MOVE_RIGHT: return "MOVE-RIGHT";
+    case CAR_DISPLAY_AVOID_FINISHED: return "AVOID-DONE";
+    case CAR_DISPLAY_STOP: return "STOP";
+    default: return "LINE";
+    }
+}
+
 /* 绘制一个24x24中文点阵字。 */
 static void draw_hanzi(int x, int y, int index, uint16_t color)
 {
@@ -289,35 +351,34 @@ static void lcd_present(void)
 static void display_task(void *argument)
 {
     (void)argument;
-    int drawn_left_pwm = 0;
-    int drawn_back_pwm = 0;
-    int drawn_right_pwm = 0;
-    car_display_state_t drawn_state = CAR_DISPLAY_STOP;
-    TickType_t last_refresh = 0;
-    bool first_refresh = true;
-
     while (true) {
         int left_pwm = s_left_pwm;
         int back_pwm = s_back_pwm;
         int right_pwm = s_right_pwm;
         car_display_state_t state = s_state;
-        TickType_t now = xTaskGetTickCount();
-        bool changed = state != drawn_state ||
-                       abs(left_pwm - drawn_left_pwm) >= DISPLAY_PWM_CHANGE ||
-                       abs(back_pwm - drawn_back_pwm) >= DISPLAY_PWM_CHANGE ||
-                       abs(right_pwm - drawn_right_pwm) >= DISPLAY_PWM_CHANGE;
-        bool minimum_interval_reached =
-            now - last_refresh >= pdMS_TO_TICKS(DISPLAY_MIN_REFRESH_MS);
-        bool force_refresh =
-            now - last_refresh >= pdMS_TO_TICKS(DISPLAY_FORCE_REFRESH_MS);
+        char text[24];
 
-        if (first_refresh || (changed && minimum_interval_reached) || force_refresh) {
         fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, COLOR_BLACK);
-        draw_state(state);
-        fill_rect(0, 31, TFT_WIDTH, 2, RGB565(40, 80, 150));
-        draw_wheel_row(37, 'A', left_pwm, COLOR_CYAN);
-        draw_wheel_row(68, 'B', back_pwm, COLOR_YELLOW);
-        draw_wheel_row(99, 'D', right_pwm, COLOR_GREEN);
+        fill_rect(0, 0, TFT_WIDTH, 14, RGB565(0, 40, 180));
+        draw_text_large(4, 2, "LINE CAR", COLOR_WHITE);
+
+        if (s_distance_valid)
+            snprintf(text, sizeof(text), "DIST:%3dCM", (int)s_distance_cm);
+        else
+            snprintf(text, sizeof(text), "DIST:>MAX");
+        draw_text_large(2, 18, text, s_distance_valid ? COLOR_GREEN : COLOR_YELLOW);
+
+        snprintf(text, sizeof(text), "A:%s%3d", left_pwm > 0 ? "FWD" : left_pwm < 0 ? "REV" : "STOP", abs(left_pwm));
+        draw_text_large(2, 36, text, left_pwm < 0 ? COLOR_RED : COLOR_WHITE);
+        snprintf(text, sizeof(text), "D:%s%3d", right_pwm > 0 ? "FWD" : right_pwm < 0 ? "REV" : "STOP", abs(right_pwm));
+        draw_text_large(2, 54, text, right_pwm < 0 ? COLOR_RED : COLOR_WHITE);
+        snprintf(text, sizeof(text), "B:%s%3d", back_pwm > 0 ? "RGT" : back_pwm < 0 ? "LFT" : "STOP", abs(back_pwm));
+        draw_text_large(2, 72, text, back_pwm != 0 ? COLOR_YELLOW : COLOR_WHITE);
+
+        snprintf(text, sizeof(text), "EA:%ld D:%ld", (long)s_encoder_a, (long)s_encoder_d);
+        draw_text_large(2, 90, text, COLOR_CYAN);
+        snprintf(text, sizeof(text), "ST:%s", display_state_name(state));
+        draw_text_large(2, 108, text, state == CAR_DISPLAY_STOP ? COLOR_RED : COLOR_GREEN);
         lcd_present();
         if (s_spi_error != ESP_OK) {
             ESP_LOGE(TAG, "屏幕SPI传输失败，停止显示任务但保持巡线运行：%s",
@@ -325,14 +386,7 @@ static void display_task(void *argument)
             vTaskDelete(NULL);
             return;
         }
-            drawn_left_pwm = left_pwm;
-            drawn_back_pwm = back_pwm;
-            drawn_right_pwm = right_pwm;
-            drawn_state = state;
-            last_refresh = now;
-            first_refresh = false;
-        }
-        vTaskDelay(pdMS_TO_TICKS(DISPLAY_POLL_MS));
+        vTaskDelay(pdMS_TO_TICKS(TFT_REFRESH_MS));
     }
 }
 
@@ -347,6 +401,18 @@ void car_display_set(int left_pwm, int back_pwm, int right_pwm,
     if (s_state == CAR_DISPLAY_NEW_LINE && state == CAR_DISPLAY_STRAIGHT &&
         now - s_new_line_tick < pdMS_TO_TICKS(NEW_LINE_HOLD_MS)) return;
     s_state = state;
+}
+
+void car_display_set_distance(float distance_cm, bool valid)
+{
+    s_distance_cm = distance_cm;
+    s_distance_valid = valid;
+}
+
+void car_display_set_encoders(int32_t encoder_a, int32_t encoder_d)
+{
+    s_encoder_a = encoder_a;
+    s_encoder_d = encoder_d;
 }
 
 esp_err_t car_display_init(void)
