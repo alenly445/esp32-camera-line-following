@@ -1,48 +1,32 @@
-# ESP32-S3 单摄像头黑线巡线
+# ESP32-S3 红球 -> 左侧蓝色球门
 
-本仓库是小车摄像头巡线的精简共享版本。JQ-CAM12 通过 USB Host 连接 ESP32-S3，由芯片本地完成 MJPEG 解码、黑线检测、前视预测和 TB6612 电机控制；正常运行不依赖电脑或 Python。
+这是一个独立的 ESP-IDF 测试工程，只实现红球进入左前方蓝色球门。
 
-## 目录
+## 逻辑
 
-```text
-esp32_car_vision/          ESP-IDF 摄像头巡线主工程
-  main/car_vision_main.c   识别、预测、状态机和电机控制
-  main/tjpgd.*             Tiny JPEG Decoder
-  README.md                编译、烧录和调参说明
-test/line_detect.py        电脑端 OpenCV 阈值标定工具
-v20_line_car_vscode.ino    原 v20 小车控制程序，保留作参考
-摄像头型号与使用说明.md     摄像头接线与硬件记录
+- 找球、接近球、收球和找球门阶段完全不使用巡线逻辑。
+- 远距离以红球中心对准摄像头中心线。
+- 红球接近铲斗后，允许从画面消失；红球消失且超声距离不大于 10 cm，连续确认后认为红球已进入铲斗。
+- 收球后持续监测超声近距离状态。
+- 找球门时搜索左侧蓝色区域，并直接把蓝色区域作为球门入口。
+- 已删除 `GOAL_FINAL_ALIGN`，直接执行 `GOAL_ALIGN -> GOAL_APPROACH -> GOAL_PUSH`。
+- `GOAL_VERIFY` 当前只停车短暂保持，然后默认进球成功，进入 `ALL_DONE`。
+
+## 接线
+
+- JQ-CAM12：`D- -> GPIO19`、`D+ -> GPIO20`、稳定 5V、共地。
+- TB6612：`STBY=10`；左 A `PWM/IN1/IN2=11/12/13`；右 D `17/18/21`。
+- 当前先复用现有单路超声：`TRIG=GPIO7`、`ECHO=GPIO6`。
+- 后部 B 电机通道保持停止。第二路 HC-SR04P 的 GPIO 尚未在现有工程中定义，本版本不擅自占用引脚。
+
+## 编译和烧录
+
+```bash
+cd "/Users/mengyangzu/Documents/ChatGPT/ardui/esp32_red_ball_left_goal"
+./idf-run.sh build
+./idf-run.sh -p /dev/cu.usbserial-0001 flash monitor
 ```
 
-## 当前硬件映射
+默认 `MOTOR_OUTPUT_ENABLED` 为 `0`，先架空车轮观察串口和浏览器画面；确认方向后再将其改为 `1` 重新编译烧录。
 
-- 摄像头：`GPIO19=D-`、`GPIO20=D+`，另接稳定的 `5V/GND`
-- TB6612：`STBY=GPIO10`
-- 左前 A：`PWM/IN1/IN2 = GPIO11/12/13`
-- 后轮 B：`GPIO14/15/16`，摄像头巡线时保持停止
-- 右前 D：`PWM/IN1/IN2 = GPIO17/18/21`
-
-## 快速开始
-
-安装 ESP-IDF 5.4.x，在 ESP-IDF PowerShell 中运行：
-
-```powershell
-cd esp32_car_vision
-idf.py set-target esp32s3
-idf.py build
-idf.py -p COM7 flash monitor
-```
-
-退出串口监视器按 `Ctrl+]`。固件当前启用了电机，烧录或复位前必须将小车架空。具体调参方法见 [esp32_car_vision/README.md](esp32_car_vision/README.md)。
-
-## 当前控制策略
-
-- 灰度阈值分割黑线，只选择与画面底部相连的主要区域
-- 近、中、远三个观察区联合估计方向
-- 连续多帧确认后驱动
-- 短时丢线保持最后方向，超过限制立即停车
-- 当前实车调参值以 `car_vision_main.c` 顶部宏定义为准
-
-## 安全说明
-
-首次使用或修改转向参数后，必须先架空检查左右轮方向和 `LOST_STOP`。摄像头断线、电机方向异常或串口出现崩溃日志时，不要直接落地运行。
+Wi-Fi：`ESP32-RedBall`，密码：`redball123`。连接后打开 `http://192.168.4.1`。
