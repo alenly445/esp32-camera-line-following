@@ -14,7 +14,6 @@
 #include "driver/ledc.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
 #include "esp_event.h"
@@ -25,6 +24,7 @@
 #include "usb/usb_host.h"
 #include "usb/uvc_host.h"
 #include "tjpgd.h"
+#include "car_display.h"
 
 #define CAM_W 640
 #define CAM_H 480
@@ -44,22 +44,40 @@
 
 /* Motor output is enabled for the live camera line-following test. */
 #define MOTOR_OUTPUT_ENABLED 1
-#define BASE_PWM 45
-#define HOLD_PWM 24
+#define BASE_PWM 44
+#define HOLD_PWM 41
 #define MAX_CORRECTION 18
-#define START_BOOST_PWM 22
+#define START_BOOST_PWM 18
+#define TURN_START_BOOST_PWM 10
 #define START_BOOST_FRAMES 1
 #define TRACK_DRIVE_FRAMES 2
-#define TRACK_PAUSE_FRAMES 3
-#define CORNER_ERROR_THRESHOLD 36
-#define CORNER_BASE_PWM 32
+#define TRACK_PAUSE_FRAMES 2
+#define CORNER_ERROR_THRESHOLD 56
+#define CORNER_BASE_PWM 42
 #define CORNER_MAX_CORRECTION 38
-#define CORNER_SEARCH_PWM 40
-#define CORNER_SEARCH_TURN_FRAMES 4
-#define CORNER_SEARCH_PAUSE_FRAMES 6
+#define CORNER_SEARCH_PWM 36
+#define CORNER_ALIGN_PWM 34
+#define CORNER_SEARCH_TURN_FRAMES 1
+#define CORNER_SEARCH_PAUSE_FRAMES 3
 #define CORNER_SEARCH_CYCLES 12
-#define CORNER_SEARCH_FRAMES ((CORNER_SEARCH_TURN_FRAMES + CORNER_SEARCH_PAUSE_FRAMES) * CORNER_SEARCH_CYCLES)
+#define CORNER_SEARCH_FRAMES \
+    ((CORNER_SEARCH_TURN_FRAMES + CORNER_SEARCH_PAUSE_FRAMES) * CORNER_SEARCH_CYCLES)
 #define TURN_MEMORY_ERROR 18
+#define TURN_HINT_CONFIRM_FRAMES 2
+#define TURN_APPROACH_PWM 50
+#define TURN_APPROACH_ENCODER_COUNTS 200
+/* 仅供已记忆的连续转弯使用；可独立调节，不影响普通转弯。 */
+#define CONTINUOUS_TURN_APPROACH_ENCODER_COUNTS 100
+#define TURN_APPROACH_CHECK_MS 10
+#define TURN_MIN_ROTATE_FRAMES 4
+#define TURN_CANDIDATE_FRAMES 2
+#define TURN_CANDIDATE_MISS_FRAMES 3
+#define TURN_REACQUIRE_ERROR 80
+#define TURN_REACQUIRE_FRAMES 2
+#define NEXT_TURN_CURVE_DELTA 50
+#define NEXT_TURN_CONFIRM_FRAMES 2
+#define NEXT_TURN_LOST_FRAMES 2
+#define NEXT_TURN_EXPIRE_FRAMES 12
 
 /* Existing Arduino wiring. GPIO19/20 remain reserved for native USB camera. */
 #define STBY_PIN 10
@@ -75,17 +93,51 @@
 #define TRIG_PIN 7
 #define ECHO_PIN 6
 
+/* A、D 驱动轮霍尔编码器接线，与原 Arduino 工程保持一致。 */
+#define ENCODER_A_PHASE_A_PIN 48
+#define ENCODER_A_PHASE_B_PIN 47
+#define ENCODER_B_PHASE_A_PIN 40
+#define ENCODER_B_PHASE_B_PIN 39
+#define ENCODER_D_PHASE_A_PIN 42
+#define ENCODER_D_PHASE_B_PIN 41
+
 #define OBSTACLE_THRESHOLD_CM 15.0f
+#define OBSTACLE_CLEAR_CM 30.0f
+#define OBSTACLE_CLEAR_COUNT 1
 #define MAX_DISTANCE_CM 400.0f
 #define ULTRASONIC_TIMEOUT_US 30000
 #define ULTRASONIC_INTERVAL_MS 50
-#define OBSTACLE_TURN_MS 600
-#define OBSTACLE_CHECK_MS 600
-#define TURN_PWM 35
+#define OBSTACLE_BRAKE_MS 800
+#define OBSTACLE_MIN_SIDE_MS 500
+#define OBSTACLE_CLEAR_EXTRA_LEFT_MS 150
+#define OBSTACLE_STOP_PAUSE_MS 800
+#define OBSTACLE_LATERAL_A_PWM 36
+#define OBSTACLE_LATERAL_B_PWM 58
+#define OBSTACLE_LATERAL_D_PWM 36
+#define OBSTACLE_RIGHT_A_PWM 35
+#define OBSTACLE_RIGHT_B_PWM 58
+#define OBSTACLE_RIGHT_D_PWM 35
+#define OBSTACLE_LATERAL_SYNC_DIVISOR 6
+#define OBSTACLE_LATERAL_SYNC_MAX 6
+#define OBSTACLE_LATERAL_MIN_PWM 35
+#define OBSTACLE_FORWARD_A_PWM 42
+#define OBSTACLE_FORWARD_D_PWM 42
+#define OBSTACLE_FORWARD_MIN_PWM 38
+#define OBSTACLE_FORWARD_TARGET_COUNTS 500
+#define OBSTACLE_FORWARD_TIMEOUT_MS 2500
+#define OBSTACLE_FORWARD_SYNC_DIVISOR 8
+#define OBSTACLE_FORWARD_SYNC_MAX 14
+#define OBSTACLE_RIGHT_MOVE_MS 1000
+#define OBSTACLE_RIGHT_STOP_MS 1000
+#define OBSTACLE_FOLLOW_AFTER_MS 1500
 
 #define FRAME_BUFFERS 3
+#define FRAME_QUEUE_DEPTH 1
 #define FRAME_SIZE (CAM_W * CAM_H * 2)
 #define USB_PRIORITY 15
+#define NO_FRAME_STOP_COUNT 3
+#define DISPLAY_STARTUP_DELAY_MS 300
+#define WIFI_STARTUP_DELAY_MS 500
 
 #define WIFI_AP_SSID "ESP32-CarVision"
 #define WIFI_AP_PASSWORD "linecar123"
@@ -98,6 +150,7 @@ static volatile bool s_connected;
 static volatile bool s_vision_task_running;
 static volatile float s_distance_cm = MAX_DISTANCE_CM;
 static volatile bool s_distance_valid;
+static volatile uint32_t s_distance_version;
 static uint8_t *s_gray;
 static uint8_t *s_mask;
 static uint32_t *s_flood_queue;
@@ -110,10 +163,33 @@ static SemaphoreHandle_t s_status_lock;
 static httpd_handle_t s_http_server;
 static bool s_brake_active;
 static int s_start_boost_frames;
+static int s_turn_start_boost_frames;
+static volatile int s_command_left_pwm;
+static volatile int s_command_back_pwm;
+static volatile int s_command_right_pwm;
+static volatile int32_t s_encoder_a_count;
+static volatile int32_t s_encoder_b_count;
+static volatile int32_t s_encoder_d_count;
+static volatile int32_t s_approach_start_a;
+static volatile int32_t s_approach_start_d;
+static volatile int32_t s_approach_delta_a;
+static volatile int32_t s_approach_delta_d;
+static volatile int s_approach_direction;
+static volatile int32_t s_approach_target_counts = TURN_APPROACH_ENCODER_COUNTS;
+static volatile bool s_approach_active;
+static volatile bool s_approach_complete;
+static portMUX_TYPE s_encoder_lock = portMUX_INITIALIZER_UNLOCKED;
 
 typedef struct { const uint8_t *data; size_t size, pos; } jpeg_src_t;
 typedef struct { bool found; int area, near_x, mid_x, far_x, error; } line_result_t;
-typedef enum { OBSTACLE_NONE, OBSTACLE_TURN, OBSTACLE_CHECK } obstacle_state_t;
+typedef enum {
+    OBSTACLE_NONE, OBSTACLE_BRAKE, OBSTACLE_MOVE_LEFT,
+    OBSTACLE_PAUSE_TO_FORWARD, OBSTACLE_FORWARD,
+    OBSTACLE_PAUSE_TO_RIGHT, OBSTACLE_MOVE_RIGHT,
+    OBSTACLE_PAUSE_AFTER_RIGHT, OBSTACLE_FOLLOW_AFTER_RIGHT,
+    OBSTACLE_FINISHED
+} obstacle_state_t;
+typedef enum { CORNER_IDLE, CORNER_APPROACH, CORNER_ROTATE } corner_state_t;
 typedef struct {
     bool decoded;
     bool found;
@@ -123,13 +199,19 @@ typedef struct {
     int far_x;
     int error;
     float distance_cm;
-    char state[16];
+    char state[24];
 } vision_status_t;
 
 static obstacle_state_t s_obstacle_state;
 static uint32_t s_obstacle_started_ms;
-static int s_turn_direction;
+static int32_t s_obstacle_start_a, s_obstacle_start_b, s_obstacle_start_d;
+static uint8_t s_obstacle_clear_count;
+static bool s_obstacle_clear_extra_active;
+static uint32_t s_obstacle_clear_extra_started_ms;
+static uint32_t s_obstacle_pause_started_ms;
 static vision_status_t s_vision_status = {.near_x = -1, .mid_x = -1, .far_x = -1};
+
+static void begin_obstacle(void);
 
 static void publish_jpeg(const uvc_host_frame_t *frame)
 {
@@ -211,6 +293,9 @@ static void set_motor(ledc_channel_t channel, int in1, int in2, int pwm)
 
 static void drive(int left, int right)
 {
+    s_command_left_pwm = left;
+    s_command_back_pwm = 0;
+    s_command_right_pwm = right;
     if (!MOTOR_OUTPUT_ENABLED) return;
     if (left == 0 && right == 0) {
         s_start_boost_frames = 0;
@@ -230,6 +315,51 @@ static void drive(int left, int right)
     set_motor(LEDC_CHANNEL_2, DIN1_PIN, DIN2_PIN, right);
 }
 
+/* Approach 使用此入口：清除刹车后的启动增强，保持设定的匀速 PWM。 */
+static void drive_without_boost(int left, int right)
+{
+    s_start_boost_frames = 0;
+    s_turn_start_boost_frames = 0;
+    s_brake_active = false;
+    drive(left, right);
+}
+
+/* 原地转弯使用独立启动增强，不再与直线/Approach 共用增强状态。 */
+static void drive_turn(int left, int right, bool pulse_start)
+{
+    s_command_left_pwm = left;
+    s_command_back_pwm = 0;
+    s_command_right_pwm = right;
+    if (!MOTOR_OUTPUT_ENABLED) return;
+    s_start_boost_frames = 0;
+    s_brake_active = false;
+    if (pulse_start) s_turn_start_boost_frames = START_BOOST_FRAMES;
+    if (s_turn_start_boost_frames > 0) {
+        if (left) left += left > 0 ? TURN_START_BOOST_PWM : -TURN_START_BOOST_PWM;
+        if (right) right += right > 0 ? TURN_START_BOOST_PWM : -TURN_START_BOOST_PWM;
+        s_turn_start_boost_frames--;
+    }
+    gpio_set_level(STBY_PIN, left != 0 || right != 0);
+    set_motor(LEDC_CHANNEL_0, AIN1_PIN, AIN2_PIN, left);
+    set_motor(LEDC_CHANNEL_1, BIN1_PIN, BIN2_PIN, 0);
+    set_motor(LEDC_CHANNEL_2, DIN1_PIN, DIN2_PIN, right);
+}
+
+/* 三轮独立控制只供避障横移使用，普通巡线仍使用原来的 drive()。 */
+static void drive_three_wheels(int left, int back, int right)
+{
+    s_command_left_pwm = left;
+    s_command_back_pwm = back;
+    s_command_right_pwm = right;
+    if (!MOTOR_OUTPUT_ENABLED) return;
+    s_start_boost_frames = 0;
+    s_brake_active = false;
+    gpio_set_level(STBY_PIN, left != 0 || back != 0 || right != 0);
+    set_motor(LEDC_CHANNEL_0, AIN1_PIN, AIN2_PIN, left);
+    set_motor(LEDC_CHANNEL_1, BIN1_PIN, BIN2_PIN, back);
+    set_motor(LEDC_CHANNEL_2, DIN1_PIN, DIN2_PIN, right);
+}
+
 static void brake_motor(ledc_channel_t channel, int in1, int in2)
 {
     gpio_set_level(in1, 1);
@@ -241,10 +371,14 @@ static void brake_motor(ledc_channel_t channel, int in1, int in2)
 /* TB6612 short-brake is used only during intentional camera recognition pauses. */
 static void brake_drive(void)
 {
+    s_command_left_pwm = 0;
+    s_command_back_pwm = 0;
+    s_command_right_pwm = 0;
     if (!MOTOR_OUTPUT_ENABLED) return;
     s_brake_active = true;
     gpio_set_level(STBY_PIN, 1);
     brake_motor(LEDC_CHANNEL_0, AIN1_PIN, AIN2_PIN);
+    brake_motor(LEDC_CHANNEL_1, BIN1_PIN, BIN2_PIN);
     brake_motor(LEDC_CHANNEL_2, DIN1_PIN, DIN2_PIN);
 }
 
@@ -252,6 +386,61 @@ static void brake_drive(void)
 static void drive_steering(int forward, int steering)
 {
     drive(forward + steering, forward - steering);
+}
+
+static void drive_turn_steering(int steering, bool pulse_start)
+{
+    drive_turn(steering, -steering, pulse_start);
+}
+
+/* 独立于摄像头帧率，每 10 ms 检查一次 approach 的霍尔距离。 */
+static void approach_control_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        bool active;
+        int direction;
+        int32_t encoder_a, encoder_d, start_a, start_d, target_counts;
+
+        portENTER_CRITICAL(&s_encoder_lock);
+        active = s_approach_active;
+        direction = s_approach_direction;
+        encoder_a = s_encoder_a_count;
+        encoder_d = s_encoder_d_count;
+        start_a = s_approach_start_a;
+        start_d = s_approach_start_d;
+        target_counts = s_approach_target_counts;
+        portEXIT_CRITICAL(&s_encoder_lock);
+
+        if (active) {
+            int32_t delta_a = encoder_a - start_a;
+            int32_t delta_d = encoder_d - start_d;
+            if (delta_a < 0) delta_a = -delta_a;
+            if (delta_d < 0) delta_d = -delta_d;
+
+            bool completed = false;
+            portENTER_CRITICAL(&s_encoder_lock);
+            s_approach_delta_a = delta_a;
+            s_approach_delta_d = delta_d;
+            if (s_approach_active &&
+                delta_a >= target_counts &&
+                delta_d >= target_counts) {
+                s_approach_active = false;
+                s_approach_complete = true;
+                completed = true;
+            }
+            portEXIT_CRITICAL(&s_encoder_lock);
+
+            if (completed) {
+                drive_turn_steering(direction * CORNER_SEARCH_PWM, false);
+                ESP_LOGW(TAG,
+                         "approach complete: A=%ld D=%ld; immediately start %s turn",
+                         (long)delta_a, (long)delta_d,
+                         direction < 0 ? "LEFT" : "RIGHT");
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(TURN_APPROACH_CHECK_MS));
+    }
 }
 
 static int steering_correction(int error, int limit)
@@ -299,16 +488,30 @@ static void ultrasonic_task(void *arg)
     io.pull_up_en = GPIO_PULLUP_DISABLE;
     ESP_ERROR_CHECK(gpio_config(&io));
 
+    uint32_t last_log_ms = 0;
     while (true) {
         float total = 0.0f;
         int valid = 0;
         for (int i = 0; i < 3; ++i) {
             float sample;
-            if (read_ultrasonic(&sample)) { total += sample; valid++; }
+            if (read_ultrasonic(&sample)) {
+                total += sample;
+                valid++;
+            }
             vTaskDelay(pdMS_TO_TICKS(10));
         }
         s_distance_valid = valid > 0;
         s_distance_cm = valid ? total / valid : MAX_DISTANCE_CM;
+        s_distance_version++;
+
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        if (now_ms - last_log_ms >= 500) {
+            ESP_LOGI(TAG, "ultrasonic valid=%d distance=%.1f cm trig=%d echo=%d",
+                     s_distance_valid, s_distance_cm, TRIG_PIN, ECHO_PIN);
+            last_log_ms = now_ms;
+        }
+
+        /* 超声任务直接抢占巡线：不再依赖下一帧摄像头到达才触发避障。 */
         vTaskDelay(pdMS_TO_TICKS(ULTRASONIC_INTERVAL_MS));
     }
 }
@@ -397,6 +600,25 @@ static line_result_t detect_line(void)
     out.error = target_x - IMG_W / 2;
     if (abs(out.error) <= CENTER_ERROR_DEADBAND) out.error = 0;
     return out;
+}
+
+/* 把摄像头巡线状态转换成显示屏上的中文过程提示。 */
+static car_display_state_t display_state_from_navigation(const char *state,
+                                                         const line_result_t *line)
+{
+    if (strcmp(state, "AVOID_LEFT") == 0) return CAR_DISPLAY_MOVE_LEFT;
+    if (strcmp(state, "PEND_LEFT") == 0)
+        return line->found ? CAR_DISPLAY_DETECTED_LEFT : CAR_DISPLAY_LOST_FORWARD;
+    if (strcmp(state, "PEND_RIGHT") == 0)
+        return line->found ? CAR_DISPLAY_DETECTED_RIGHT : CAR_DISPLAY_LOST_FORWARD;
+    if (strcmp(state, "TURN_LEFT") == 0) return CAR_DISPLAY_TURNING_LEFT;
+    if (strcmp(state, "TURN_RIGHT") == 0) return CAR_DISPLAY_TURNING_RIGHT;
+    if (strcmp(state, "TURN_ALIGN_LEFT") == 0 ||
+        strcmp(state, "TURN_CHECK_LEFT") == 0) return CAR_DISPLAY_TURNING_LEFT;
+    if (strcmp(state, "TURN_ALIGN_RIGHT") == 0 ||
+        strcmp(state, "TURN_CHECK_RIGHT") == 0) return CAR_DISPLAY_TURNING_RIGHT;
+    if (strcmp(state, "REACQUIRED") == 0) return CAR_DISPLAY_NEW_LINE;
+    return CAR_DISPLAY_STRAIGHT;
 }
 
 static esp_err_t root_handler(httpd_req_t *req)
@@ -576,36 +798,196 @@ static void start_web_server(void)
 
 static void begin_obstacle(void)
 {
-    s_obstacle_state = OBSTACLE_TURN;
+    /* 障碍物优先级最高：记录起点后立即左横移，不等待原巡线状态结束。 */
+    s_obstacle_state = OBSTACLE_BRAKE;
     s_obstacle_started_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    s_turn_direction = (esp_random() & 1) ? 1 : -1;
+    s_obstacle_clear_count = 0;
+    s_obstacle_clear_extra_active = false;
+    s_obstacle_clear_extra_started_ms = 0;
+    s_obstacle_pause_started_ms = 0;
+    portENTER_CRITICAL(&s_encoder_lock);
+    s_approach_active = false;
+    s_approach_complete = false;
+    portEXIT_CRITICAL(&s_encoder_lock);
+    /* 超声任务触发后立即给出左横移PWM，获得最高动作优先级。 */
     drive(0, 0);
-    ESP_LOGW(TAG, "obstacle %.1f cm, turning %s", s_distance_cm,
-             s_turn_direction > 0 ? "right" : "left");
+    ESP_LOGW(TAG, "obstacle %.1f cm; stop before moving left", s_distance_cm);
 }
 
-static bool handle_obstacle(void)
+/* 右移采用固定时序：右移300ms，停车500ms，巡线500ms，然后停车。 */
+static bool handle_obstacle(bool new_distance_sample)
 {
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-    if (s_obstacle_state == OBSTACLE_NONE && s_distance_valid &&
+    if (s_obstacle_state == OBSTACLE_NONE && new_distance_sample && s_distance_valid &&
         s_distance_cm < OBSTACLE_THRESHOLD_CM) begin_obstacle();
+    if (s_obstacle_state == OBSTACLE_NONE) return false;
 
-    if (s_obstacle_state == OBSTACLE_TURN) {
-        if (now - s_obstacle_started_ms < OBSTACLE_TURN_MS) {
-            drive(s_turn_direction * TURN_PWM, -s_turn_direction * TURN_PWM);
-        } else {
-            s_obstacle_state = OBSTACLE_CHECK;
+    switch (s_obstacle_state) {
+    case OBSTACLE_BRAKE:
+        /* 兼容旧状态值；新流程不会进入此等待状态。 */
+        drive(0, 0);
+        if (now - s_obstacle_started_ms >= OBSTACLE_BRAKE_MS) {
+            portENTER_CRITICAL(&s_encoder_lock);
+            s_obstacle_start_a = s_encoder_a_count;
+            s_obstacle_start_b = s_encoder_b_count;
+            s_obstacle_start_d = s_encoder_d_count;
+            portEXIT_CRITICAL(&s_encoder_lock);
+            s_obstacle_state = OBSTACLE_MOVE_LEFT;
             s_obstacle_started_ms = now;
-            drive(0, 0);
+            s_obstacle_clear_count = 0;
+            s_obstacle_clear_extra_active = false;
+            car_display_set(0, 0, 0, CAR_DISPLAY_MOVE_LEFT);
+            ESP_LOGW(TAG, "avoidance: start left lateral move");
         }
-        return true;
+        break;
+
+    case OBSTACLE_MOVE_LEFT: {
+        int32_t a, b, d;
+        portENTER_CRITICAL(&s_encoder_lock);
+        a = -(s_encoder_a_count - s_obstacle_start_a);
+        b =  (s_encoder_b_count - s_obstacle_start_b);
+        d = -(s_encoder_d_count - s_obstacle_start_d);
+        portEXIT_CRITICAL(&s_encoder_lock);
+        if (a < 0) a = 0;
+        if (b < 0) b = 0;
+        if (d < 0) d = 0;
+        int a_corr = clampi((int)(b / 2 - a) / OBSTACLE_LATERAL_SYNC_DIVISOR,
+                            -OBSTACLE_LATERAL_SYNC_MAX, OBSTACLE_LATERAL_SYNC_MAX);
+        int d_corr = clampi((int)(b / 2 - d) / OBSTACLE_LATERAL_SYNC_DIVISOR,
+                            -OBSTACLE_LATERAL_SYNC_MAX, OBSTACLE_LATERAL_SYNC_MAX);
+        int a_pwm = clampi(OBSTACLE_LATERAL_A_PWM + a_corr, OBSTACLE_LATERAL_MIN_PWM, 255);
+        int d_pwm = clampi(OBSTACLE_LATERAL_D_PWM + d_corr, OBSTACLE_LATERAL_MIN_PWM, 255);
+        drive_three_wheels(-a_pwm, -OBSTACLE_LATERAL_B_PWM, d_pwm);
+        if (!s_obstacle_clear_extra_active && new_distance_sample &&
+            now - s_obstacle_started_ms >= OBSTACLE_MIN_SIDE_MS) {
+            bool clear = !s_distance_valid || s_distance_cm > OBSTACLE_CLEAR_CM;
+            if (clear) {
+                if (s_obstacle_clear_count < OBSTACLE_CLEAR_COUNT)
+                    s_obstacle_clear_count++;
+            } else {
+                s_obstacle_clear_count = 0;
+            }
+        }
+        if (!s_obstacle_clear_extra_active &&
+            s_obstacle_clear_count >= OBSTACLE_CLEAR_COUNT) {
+            s_obstacle_clear_extra_active = true;
+            s_obstacle_clear_extra_started_ms = now;
+            ESP_LOGW(TAG, "avoidance: front clear confirmed");
+        }
+        if (s_obstacle_clear_extra_active &&
+            now - s_obstacle_clear_extra_started_ms >= OBSTACLE_CLEAR_EXTRA_LEFT_MS) {
+            brake_drive();
+            s_obstacle_state = OBSTACLE_PAUSE_TO_FORWARD;
+            s_obstacle_pause_started_ms = now;
+            ESP_LOGW(TAG, "avoidance: left clear; pause before forward");
+        }
+        break;
     }
-    if (s_obstacle_state == OBSTACLE_CHECK) {
-        if (now - s_obstacle_started_ms < OBSTACLE_CHECK_MS) drive(BASE_PWM / 2, BASE_PWM / 2);
-        else { s_obstacle_state = OBSTACLE_NONE; drive(0, 0); }
-        return true;
+
+    case OBSTACLE_PAUSE_TO_FORWARD:
+        brake_drive();
+        if (now - s_obstacle_pause_started_ms >= OBSTACLE_STOP_PAUSE_MS) {
+            portENTER_CRITICAL(&s_encoder_lock);
+            s_obstacle_start_a = s_encoder_a_count;
+            s_obstacle_start_d = s_encoder_d_count;
+            portEXIT_CRITICAL(&s_encoder_lock);
+            s_obstacle_state = OBSTACLE_FORWARD;
+            s_obstacle_started_ms = now;
+            ESP_LOGW(TAG, "avoidance: encoder forward");
+        }
+        break;
+
+    case OBSTACLE_FORWARD: {
+        int32_t a, d;
+        portENTER_CRITICAL(&s_encoder_lock);
+        a = s_encoder_a_count - s_obstacle_start_a;
+        d = -(s_encoder_d_count - s_obstacle_start_d);
+        portEXIT_CRITICAL(&s_encoder_lock);
+        if (a < 0) a = 0;
+        if (d < 0) d = 0;
+        int correction = clampi((int)(d - a) / OBSTACLE_FORWARD_SYNC_DIVISOR,
+                                -OBSTACLE_FORWARD_SYNC_MAX, OBSTACLE_FORWARD_SYNC_MAX);
+        int a_pwm = clampi(OBSTACLE_FORWARD_A_PWM + correction, OBSTACLE_FORWARD_MIN_PWM, 255);
+        int d_pwm = clampi(OBSTACLE_FORWARD_D_PWM - correction, OBSTACLE_FORWARD_MIN_PWM, 255);
+        drive_three_wheels(a_pwm, 0, d_pwm);
+        if ((a >= OBSTACLE_FORWARD_TARGET_COUNTS && d >= OBSTACLE_FORWARD_TARGET_COUNTS) ||
+            now - s_obstacle_started_ms >= OBSTACLE_FORWARD_TIMEOUT_MS) {
+            brake_drive();
+            s_obstacle_state = OBSTACLE_PAUSE_TO_RIGHT;
+            s_obstacle_pause_started_ms = now;
+            ESP_LOGW(TAG, "avoidance: forward complete A=%ld D=%ld; pause before right",
+                     (long)a, (long)d);
+        }
+        break;
     }
-    return false;
+
+    case OBSTACLE_PAUSE_TO_RIGHT:
+        brake_drive();
+        if (now - s_obstacle_pause_started_ms >= OBSTACLE_STOP_PAUSE_MS) {
+            portENTER_CRITICAL(&s_encoder_lock);
+            s_obstacle_start_a = s_encoder_a_count;
+            s_obstacle_start_b = s_encoder_b_count;
+            s_obstacle_start_d = s_encoder_d_count;
+            portEXIT_CRITICAL(&s_encoder_lock);
+            s_obstacle_state = OBSTACLE_MOVE_RIGHT;
+            s_obstacle_started_ms = now;
+            ESP_LOGW(TAG, "avoidance: move right for %d ms", OBSTACLE_RIGHT_MOVE_MS);
+        }
+        break;
+
+    case OBSTACLE_MOVE_RIGHT: {
+        int32_t a, b, d;
+        portENTER_CRITICAL(&s_encoder_lock);
+        a = s_encoder_a_count - s_obstacle_start_a;
+        b = -(s_encoder_b_count - s_obstacle_start_b);
+        d = s_encoder_d_count - s_obstacle_start_d;
+        portEXIT_CRITICAL(&s_encoder_lock);
+        if (a < 0) a = 0;
+        if (b < 0) b = 0;
+        if (d < 0) d = 0;
+        int a_corr = clampi((int)(b / 2 - a) / OBSTACLE_LATERAL_SYNC_DIVISOR,
+                            -OBSTACLE_LATERAL_SYNC_MAX, OBSTACLE_LATERAL_SYNC_MAX);
+        int d_corr = clampi((int)(b / 2 - d) / OBSTACLE_LATERAL_SYNC_DIVISOR,
+                            -OBSTACLE_LATERAL_SYNC_MAX, OBSTACLE_LATERAL_SYNC_MAX);
+        int a_pwm = clampi(OBSTACLE_RIGHT_A_PWM + a_corr, OBSTACLE_LATERAL_MIN_PWM, 255);
+        int d_pwm = clampi(OBSTACLE_RIGHT_D_PWM + d_corr, OBSTACLE_LATERAL_MIN_PWM, 255);
+        drive_three_wheels(a_pwm, OBSTACLE_RIGHT_B_PWM, -d_pwm);
+        if (now - s_obstacle_started_ms >= OBSTACLE_RIGHT_MOVE_MS) {
+            brake_drive();
+            s_obstacle_state = OBSTACLE_PAUSE_AFTER_RIGHT;
+            s_obstacle_pause_started_ms = now;
+            ESP_LOGW(TAG, "avoidance: right move complete; stop for %d ms",
+                     OBSTACLE_RIGHT_STOP_MS);
+        }
+        break;
+    }
+
+    case OBSTACLE_PAUSE_AFTER_RIGHT:
+        brake_drive();
+        if (now - s_obstacle_pause_started_ms >= OBSTACLE_RIGHT_STOP_MS) {
+            s_obstacle_state = OBSTACLE_FOLLOW_AFTER_RIGHT;
+            s_obstacle_started_ms = now;
+            ESP_LOGW(TAG, "avoidance: resume line following for %d ms",
+                     OBSTACLE_FOLLOW_AFTER_MS);
+        }
+        break;
+
+    case OBSTACLE_FOLLOW_AFTER_RIGHT:
+        if (now - s_obstacle_started_ms >= OBSTACLE_FOLLOW_AFTER_MS) {
+            brake_drive();
+            s_obstacle_state = OBSTACLE_FINISHED;
+            ESP_LOGW(TAG, "avoidance: post-follow complete; car stopped");
+            return true;
+        }
+        /* 暂时交回原有巡线逻辑，不改变其识别、走停和转向计算。 */
+        return false;
+
+    case OBSTACLE_FINISHED:
+        brake_drive();
+        break;
+    case OBSTACLE_NONE: break;
+    }
+    return true;
 }
 
 static bool frame_callback(const uvc_host_frame_t *frame, void *ctx)
@@ -619,6 +1001,10 @@ static void stream_callback(const uvc_host_stream_event_data_t *event, void *ctx
     (void)ctx;
     if (event->type == UVC_HOST_DEVICE_DISCONNECTED) {
         s_connected = false;
+        portENTER_CRITICAL(&s_encoder_lock);
+        s_approach_active = false;
+        s_approach_complete = false;
+        portEXIT_CRITICAL(&s_encoder_lock);
         drive(0, 0);
         ESP_LOGW(TAG, "camera disconnected; motors stopped");
     } else if (event->type == UVC_HOST_FRAME_BUFFER_OVERFLOW) {
@@ -633,52 +1019,252 @@ static void vision_task(void *arg)
     (void)arg;
     int confirmed = 0, missing = 0, last_error = 0, last_turn_direction = 1;
     int search_frames = 0, track_frames = 0;
+    int hint_direction = 0, hint_frames = 0, rotate_frames = 0, reacquire_frames = 0;
+    int candidate_frames = 0, candidate_miss_frames = 0;
+    int next_turn_direction = 0, next_turn_confirm_frames = 0;
+    int post_turn_frames = 0, post_turn_missing_frames = 0;
+    bool new_line_candidate = false;
+    bool next_turn_valid = false, post_turn_active = false;
+    corner_state_t corner_state = CORNER_IDLE;
     unsigned frame_no = 0;
+    uint32_t last_distance_version = 0;
+    int no_frame_count = 0;
     while (s_connected) {
         uvc_host_frame_t *frame = NULL;
         if (xQueueReceive(s_frame_q, &frame, pdMS_TO_TICKS(500)) != pdPASS) {
-            drive(0, 0);
+            no_frame_count++;
+            /* 偶发缺帧不立即停机，避免摄像头短暂抖动打断巡线。 */
+            if (no_frame_count >= NO_FRAME_STOP_COUNT) {
+                portENTER_CRITICAL(&s_encoder_lock);
+                s_approach_active = false;
+                s_approach_complete = false;
+                portEXIT_CRITICAL(&s_encoder_lock);
+                drive(0, 0);
+            }
             update_vision_status(false, NULL, "NO_FRAME");
             continue;
         }
+        no_frame_count = 0;
         publish_jpeg(frame);
 
         line_result_t line = {.near_x = -1, .mid_x = -1, .far_x = -1};
         bool decoded = decode_jpeg(frame->data, frame->data_len);
         if (decoded) line = detect_line();
-        const bool obstacle_active = handle_obstacle();
+        uint32_t distance_version = s_distance_version;
+        bool new_distance_sample = distance_version != last_distance_version;
+        last_distance_version = distance_version;
+        const bool obstacle_active = handle_obstacle(new_distance_sample);
         const char *state = "LOST_STOP";
         if (obstacle_active) {
+            /* 避障运动会破坏 10 cm 距离基准，因此取消尚未完成的转弯。 */
+            corner_state = CORNER_IDLE;
+            portENTER_CRITICAL(&s_encoder_lock);
+            s_approach_active = false;
+            s_approach_complete = false;
+            portEXIT_CRITICAL(&s_encoder_lock);
+            hint_frames = 0;
+            next_turn_direction = 0;
+            next_turn_confirm_frames = 0;
+            next_turn_valid = false;
+            post_turn_active = false;
             track_frames = 0;
-            state = s_obstacle_state == OBSTACLE_TURN ? "AVOID_TURN" : "AVOID_CHECK";
+            switch (s_obstacle_state) {
+            case OBSTACLE_BRAKE: state = "AVOID_BRAKE"; break;
+            case OBSTACLE_MOVE_LEFT: state = "AVOID_LEFT"; break;
+            case OBSTACLE_PAUSE_TO_FORWARD: state = "AVOID_PAUSE_FORWARD"; break;
+            case OBSTACLE_FORWARD: state = "AVOID_FORWARD"; break;
+            case OBSTACLE_PAUSE_TO_RIGHT: state = "AVOID_PAUSE_RIGHT"; break;
+            case OBSTACLE_MOVE_RIGHT: state = "AVOID_RIGHT"; break;
+            case OBSTACLE_PAUSE_AFTER_RIGHT: state = "AVOID_PAUSE_RIGHT"; break;
+            case OBSTACLE_FOLLOW_AFTER_RIGHT: state = "AVOID_FOLLOW"; break;
+            case OBSTACLE_FINISHED: state = "AVOID_FINISHED"; break;
+            case OBSTACLE_NONE: state = "AVOID_DONE"; break;
+            }
+        } else if (corner_state == CORNER_APPROACH) {
+            int32_t encoder_a, encoder_d, approach_a, approach_d, approach_target;
+            bool approach_complete;
+            portENTER_CRITICAL(&s_encoder_lock);
+            encoder_a = s_encoder_a_count;
+            encoder_d = s_encoder_d_count;
+            approach_a = s_approach_delta_a;
+            approach_d = s_approach_delta_d;
+            approach_target = s_approach_target_counts;
+            approach_complete = s_approach_complete;
+            if (approach_complete) s_approach_complete = false;
+            portEXIT_CRITICAL(&s_encoder_lock);
+
+            /* 实车前进时 A 为正、D 为负，分别换算成正向行驶计数。 */
+            /* 这里只测量距离，不关心编码器的正负方向。 */
+            state = last_turn_direction < 0 ? "PEND_LEFT" : "PEND_RIGHT";
+            if ((frame_no + 1) % 5 == 0) {
+                ESP_LOGI(TAG,
+                         "approach state=%s enc_raw=A%ld/D%ld delta=A%ld/D%ld target=%d",
+                         state, (long)encoder_a, (long)encoder_d,
+                         (long)approach_a, (long)approach_d,
+                         (int)approach_target);
+            }
+            if (approach_complete) {
+                corner_state = CORNER_ROTATE;
+                rotate_frames = 0;
+                reacquire_frames = 0;
+                candidate_frames = 0;
+                candidate_miss_frames = 0;
+                new_line_candidate = false;
+                next_turn_direction = 0;
+                next_turn_confirm_frames = 0;
+                next_turn_valid = false;
+                post_turn_active = false;
+                state = last_turn_direction < 0 ? "TURN_LEFT" : "TURN_RIGHT";
+            }
+        } else if (corner_state == CORNER_ROTATE) {
+            /* 至少先旋转数帧，再允许画面中的旧线路触发重新捕获。 */
+            int phase_length = CORNER_SEARCH_TURN_FRAMES + CORNER_SEARCH_PAUSE_FRAMES;
+            int phase = rotate_frames % phase_length;
+            bool observing = phase >= CORNER_SEARCH_TURN_FRAMES;
+            bool observation_settled = phase > CORNER_SEARCH_TURN_FRAMES;
+
+            /* 不设置转弯超时：未重新识别到黑线时持续执行“旋转—停车观察”。 */
+            if (!observing) {
+                int turn_pwm = new_line_candidate ? CORNER_ALIGN_PWM : CORNER_SEARCH_PWM;
+                drive_turn_steering(last_turn_direction * turn_pwm, phase == 0);
+                state = new_line_candidate
+                            ? (last_turn_direction < 0 ? "TURN_ALIGN_LEFT" : "TURN_ALIGN_RIGHT")
+                            : (last_turn_direction < 0 ? "TURN_LEFT" : "TURN_RIGHT");
+                reacquire_frames = 0;
+                rotate_frames++;
+            } else {
+                /* 停车后的第一帧只用于消除运动模糊，后续帧才判断新线。 */
+                if (phase == CORNER_SEARCH_TURN_FRAMES) brake_drive();
+                else drive(0, 0);
+                state = last_turn_direction < 0 ? "TURN_CHECK_LEFT" : "TURN_CHECK_RIGHT";
+
+                if (observation_settled) {
+                    bool candidate_visible = line.found &&
+                                             (line.near_x >= 0 || line.mid_x >= 0);
+                    if (candidate_visible) {
+                        candidate_frames++;
+                        candidate_miss_frames = 0;
+                    } else {
+                        candidate_frames = 0;
+                        if (new_line_candidate) candidate_miss_frames++;
+                    }
+                    if (candidate_frames >= TURN_CANDIDATE_FRAMES)
+                        new_line_candidate = true;
+                    if (candidate_miss_frames >= TURN_CANDIDATE_MISS_FRAMES) {
+                        new_line_candidate = false;
+                        candidate_miss_frames = 0;
+                    }
+
+                    if (new_line_candidate && line.found && line.near_x >= 0 &&
+                        abs(line.error) <= TURN_REACQUIRE_ERROR)
+                        reacquire_frames++;
+                    else
+                        reacquire_frames = 0;
+
+                    /* 当前新线接近对准后，用近端到远端的弯曲方向记忆紧邻的下一弯。 */
+                    if (!next_turn_valid) {
+                        int next_hint = 0;
+                        if (new_line_candidate && line.near_x >= 0 && line.far_x >= 0 &&
+                            abs(line.error) <= TURN_REACQUIRE_ERROR) {
+                            int curve_delta = line.far_x - line.near_x;
+                            if (abs(curve_delta) >= NEXT_TURN_CURVE_DELTA)
+                                next_hint = curve_delta > 0 ? 1 : -1;
+                        }
+                        if (next_hint != 0 && next_hint == next_turn_direction) {
+                            if (next_turn_confirm_frames < NEXT_TURN_CONFIRM_FRAMES)
+                                next_turn_confirm_frames++;
+                        } else if (next_hint != 0) {
+                            next_turn_direction = next_hint;
+                            next_turn_confirm_frames = 1;
+                        } else {
+                            next_turn_direction = 0;
+                            next_turn_confirm_frames = 0;
+                        }
+                        if (next_turn_confirm_frames >= NEXT_TURN_CONFIRM_FRAMES) {
+                            next_turn_valid = true;
+                            ESP_LOGW(TAG, "next corner memorized during turn: %s",
+                                     next_turn_direction < 0 ? "LEFT" : "RIGHT");
+                        }
+                    }
+                }
+                rotate_frames++;
+            }
+
+            if (reacquire_frames >= TURN_REACQUIRE_FRAMES) {
+                corner_state = CORNER_IDLE;
+                confirmed = CONFIRM_FRAMES;
+                missing = 0;
+                last_error = line.error;
+                hint_frames = 0;
+                post_turn_active = next_turn_valid;
+                post_turn_frames = 0;
+                post_turn_missing_frames = 0;
+                drive_steering(BASE_PWM, steering_correction(last_error, MAX_CORRECTION));
+                state = "REACQUIRED";
+                ESP_LOGW(TAG, "new path reacquired; resume line following; next=%s",
+                         next_turn_valid ? (next_turn_direction < 0 ? "LEFT" : "RIGHT")
+                                         : "NONE");
+            }
         } else {
             if (line.found) {
                 missing = 0;
                 search_frames = 0;
-                if (abs(line.error) >= TURN_MEMORY_ERROR)
-                    last_turn_direction = line.error > 0 ? 1 : -1;
+                if (post_turn_active) {
+                    post_turn_missing_frames = 0;
+                    post_turn_frames++;
+                    if (post_turn_frames >= NEXT_TURN_EXPIRE_FRAMES) {
+                        post_turn_active = false;
+                        next_turn_valid = false;
+                        next_turn_direction = 0;
+                    }
+                }
+                int current_hint = abs(line.error) >= CORNER_ERROR_THRESHOLD
+                                   ? (line.error > 0 ? 1 : -1) : 0;
+                if (current_hint != 0 && current_hint == hint_direction)
+                    hint_frames++;
+                else {
+                    hint_direction = current_hint;
+                    hint_frames = current_hint != 0 ? 1 : 0;
+                }
+
+                if (hint_frames >= TURN_HINT_CONFIRM_FRAMES) {
+                    last_turn_direction = hint_direction;
+                    post_turn_active = false;
+                    next_turn_valid = false;
+                    next_turn_direction = 0;
+                    portENTER_CRITICAL(&s_encoder_lock);
+                    s_approach_start_a = s_encoder_a_count;
+                    s_approach_start_d = s_encoder_d_count;
+                    s_approach_delta_a = 0;
+                    s_approach_delta_d = 0;
+                    s_approach_direction = last_turn_direction;
+                    s_approach_target_counts = TURN_APPROACH_ENCODER_COUNTS;
+                    s_approach_complete = false;
+                    s_approach_active = true;
+                    portEXIT_CRITICAL(&s_encoder_lock);
+                    corner_state = CORNER_APPROACH;
+                    hint_frames = 0;
+                    track_frames = 0;
+                    drive_without_boost(TURN_APPROACH_PWM, TURN_APPROACH_PWM);
+                    state = last_turn_direction < 0 ? "PEND_LEFT" : "PEND_RIGHT";
+                    ESP_LOGW(TAG, "corner memorized: %s; approach target A/D=%d",
+                             last_turn_direction < 0 ? "LEFT" : "RIGHT",
+                             TURN_APPROACH_ENCODER_COUNTS);
+                    goto vision_frame_done;
+                }
                 if (confirmed < CONFIRM_FRAMES) confirmed++;
                 if (confirmed >= CONFIRM_FRAMES) {
-                    bool corner = abs(line.error) >= CORNER_ERROR_THRESHOLD || line.near_x < 0;
-                    last_error = corner ? (last_error + line.error) / 2
-                                        : (3 * last_error + line.error) / 4;
-                    int correction = steering_correction(last_error,
-                                                         corner ? CORNER_MAX_CORRECTION : MAX_CORRECTION);
-                    if (corner) {
-                        track_frames = 0;
-                        drive_steering(CORNER_BASE_PWM, correction);
-                        state = "CORNER_TRACK";
+                    last_error = (3 * last_error + line.error) / 4;
+                    int correction = steering_correction(last_error, MAX_CORRECTION);
+                    int phase = track_frames % (TRACK_DRIVE_FRAMES + TRACK_PAUSE_FRAMES);
+                    if (phase < TRACK_DRIVE_FRAMES) {
+                        drive_steering(BASE_PWM, correction);
+                        state = "TRACK";
                     } else {
-                        int phase = track_frames % (TRACK_DRIVE_FRAMES + TRACK_PAUSE_FRAMES);
-                        if (phase < TRACK_DRIVE_FRAMES) {
-                            drive_steering(BASE_PWM, correction);
-                            state = "TRACK";
-                        } else {
-                            brake_drive();
-                            state = "TRACK_CHECK";
-                        }
-                        track_frames++;
+                        brake_drive();
+                        state = "TRACK_CHECK";
                     }
+                    track_frames++;
                 } else {
                     track_frames = 0;
                     drive(0, 0);
@@ -687,13 +1273,43 @@ static void vision_task(void *arg)
                 confirmed = 0;
                 missing++;
                 track_frames = 0;
+                if (post_turn_active && next_turn_valid && decoded) {
+                    post_turn_missing_frames++;
+                    if (post_turn_missing_frames >= NEXT_TURN_LOST_FRAMES) {
+                        last_turn_direction = next_turn_direction;
+                        post_turn_active = false;
+                        next_turn_valid = false;
+                        next_turn_direction = 0;
+                        portENTER_CRITICAL(&s_encoder_lock);
+                        s_approach_start_a = s_encoder_a_count;
+                        s_approach_start_d = s_encoder_d_count;
+                        s_approach_delta_a = 0;
+                        s_approach_delta_d = 0;
+                        s_approach_direction = last_turn_direction;
+                        s_approach_target_counts = CONTINUOUS_TURN_APPROACH_ENCODER_COUNTS;
+                        s_approach_complete = false;
+                        s_approach_active = true;
+                        portEXIT_CRITICAL(&s_encoder_lock);
+                        corner_state = CORNER_APPROACH;
+                        hint_frames = 0;
+                        drive_without_boost(TURN_APPROACH_PWM, TURN_APPROACH_PWM);
+                        state = last_turn_direction < 0 ? "PEND_LEFT" : "PEND_RIGHT";
+                        ESP_LOGW(TAG,
+                                 "continuous corner activated after line loss: %s; target=%d",
+                                 last_turn_direction < 0 ? "LEFT" : "RIGHT",
+                                 CONTINUOUS_TURN_APPROACH_ENCODER_COUNTS);
+                        goto vision_frame_done;
+                    }
+                }
                 if (missing <= BLIND_HOLD_FRAMES) {
                     drive_steering(HOLD_PWM, steering_correction(last_error, MAX_CORRECTION));
                     state = "BLIND_HOLD";
                 } else if (search_frames < CORNER_SEARCH_FRAMES) {
-                    int phase = search_frames % (CORNER_SEARCH_TURN_FRAMES + CORNER_SEARCH_PAUSE_FRAMES);
+                    int phase = search_frames %
+                        (CORNER_SEARCH_TURN_FRAMES + CORNER_SEARCH_PAUSE_FRAMES);
                     if (phase < CORNER_SEARCH_TURN_FRAMES) {
-                        drive_steering(0, last_turn_direction * CORNER_SEARCH_PWM);
+                        drive_turn_steering(last_turn_direction * CORNER_SEARCH_PWM,
+                                            phase == 0);
                         state = "CORNER_TURN";
                     } else {
                         brake_drive();
@@ -707,7 +1323,10 @@ static void vision_task(void *arg)
             }
             if (line.found && confirmed < CONFIRM_FRAMES) state = "CONFIRM";
         }
+vision_frame_done:
         update_vision_status(decoded, &line, state);
+        car_display_set(s_command_left_pwm, s_command_back_pwm, s_command_right_pwm,
+                        display_state_from_navigation(state, &line));
         if (++frame_no % 5 == 0) {
             ESP_LOGI(TAG, "state=%s decode=%d area=%d x=%d/%d/%d error=%d distance=%.1f motor=%s",
                      state, decoded, line.area, line.near_x, line.mid_x, line.far_x,
@@ -771,9 +1390,75 @@ static void usb_lib_task(void *arg)
     while (true) { uint32_t flags; usb_host_lib_handle_events(portMAX_DELAY, &flags); }
 }
 
+static void IRAM_ATTR encoder_a_isr(void *arg)
+{
+    (void)arg;
+    int delta = gpio_get_level(ENCODER_A_PHASE_A_PIN) ==
+                gpio_get_level(ENCODER_A_PHASE_B_PIN) ? 1 : -1;
+    portENTER_CRITICAL_ISR(&s_encoder_lock);
+    s_encoder_a_count += delta;
+    portEXIT_CRITICAL_ISR(&s_encoder_lock);
+}
+
+static void IRAM_ATTR encoder_d_isr(void *arg)
+{
+    (void)arg;
+    int delta = gpio_get_level(ENCODER_D_PHASE_A_PIN) ==
+                gpio_get_level(ENCODER_D_PHASE_B_PIN) ? 1 : -1;
+    portENTER_CRITICAL_ISR(&s_encoder_lock);
+    s_encoder_d_count += delta;
+    portEXIT_CRITICAL_ISR(&s_encoder_lock);
+}
+
+static void IRAM_ATTR encoder_b_isr(void *arg)
+{
+    (void)arg;
+    int delta = gpio_get_level(ENCODER_B_PHASE_A_PIN) ==
+                gpio_get_level(ENCODER_B_PHASE_B_PIN) ? 1 : -1;
+    portENTER_CRITICAL_ISR(&s_encoder_lock);
+    s_encoder_b_count += delta;
+    portEXIT_CRITICAL_ISR(&s_encoder_lock);
+}
+
+/* 初始化 A、D 两个霍尔编码器；只在 A 相双边沿中断中读取 B 相判向。 */
+static void encoders_init(void)
+{
+    const gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << ENCODER_A_PHASE_A_PIN) |
+                        (1ULL << ENCODER_A_PHASE_B_PIN) |
+                        (1ULL << ENCODER_B_PHASE_A_PIN) |
+                        (1ULL << ENCODER_B_PHASE_B_PIN) |
+                        (1ULL << ENCODER_D_PHASE_A_PIN) |
+                        (1ULL << ENCODER_D_PHASE_B_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&cfg));
+    ESP_ERROR_CHECK(gpio_set_intr_type(ENCODER_A_PHASE_A_PIN, GPIO_INTR_ANYEDGE));
+    ESP_ERROR_CHECK(gpio_set_intr_type(ENCODER_B_PHASE_A_PIN, GPIO_INTR_ANYEDGE));
+    ESP_ERROR_CHECK(gpio_set_intr_type(ENCODER_D_PHASE_A_PIN, GPIO_INTR_ANYEDGE));
+    ESP_ERROR_CHECK(gpio_install_isr_service(ESP_INTR_FLAG_IRAM));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(ENCODER_A_PHASE_A_PIN, encoder_a_isr, NULL));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(ENCODER_B_PHASE_A_PIN, encoder_b_isr, NULL));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(ENCODER_D_PHASE_A_PIN, encoder_d_isr, NULL));
+}
+
 void app_main(void)
 {
     motors_init();
+    encoders_init();
+    BaseType_t approach_task_created =
+        xTaskCreatePinnedToCore(approach_control_task, "approach_ctrl", 3072,
+                                NULL, USB_PRIORITY - 1, NULL, 1);
+    assert(approach_task_created == pdPASS);
+    esp_err_t display_error = car_display_init();
+    if (display_error != ESP_OK)
+        ESP_LOGE(TAG, "display initialization failed: %s",
+                 esp_err_to_name(display_error));
+    /* 让显示屏上电初始化结束后，再启动摄像头和无线网络等较大负载。 */
+    vTaskDelay(pdMS_TO_TICKS(DISPLAY_STARTUP_DELAY_MS));
     s_gray = heap_caps_malloc(IMG_W * IMG_H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_mask = heap_caps_malloc(IMG_W * IMG_H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_flood_queue = heap_caps_malloc(IMG_W * IMG_H * sizeof(uint32_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -783,12 +1468,11 @@ void app_main(void)
     s_status_lock = xSemaphoreCreateMutex();
     assert(s_gray && s_mask && s_flood_queue && s_jpeg_buffers[0] && s_jpeg_buffers[1] &&
            s_jpeg_lock && s_status_lock);
-    s_frame_q = xQueueCreate(FRAME_BUFFERS, sizeof(uvc_host_frame_t *));
+    /* 只积压一帧，处理不完的新帧立即归还给 UVC，避免缓冲耗尽。 */
+    s_frame_q = xQueueCreate(FRAME_QUEUE_DEPTH, sizeof(uvc_host_frame_t *));
     assert(s_frame_q);
 
     update_vision_status(false, NULL, "BOOT");
-    wifi_start_ap();
-    start_web_server();
 
     const usb_host_config_t usb_cfg = {.skip_phy_setup = false, .intr_flags = ESP_INTR_FLAG_LOWMED};
     ESP_ERROR_CHECK(usb_host_install(&usb_cfg));
@@ -801,6 +1485,12 @@ void app_main(void)
 
     xTaskCreate(ultrasonic_task, "ultrasonic", 4096, NULL, 3, NULL);
     ESP_LOGI(TAG, "camera line following + ultrasonic avoidance ready");
-    ESP_LOGI(TAG, "camera D-=GPIO19 D+=GPIO20; TRIG=GPIO7 ECHO=GPIO6");
+    ESP_LOGI(TAG, "camera D-=GPIO19 D+=GPIO20; TRIG=GPIO%d ECHO=GPIO%d",
+             TRIG_PIN, ECHO_PIN);
     xTaskCreatePinnedToCore(camera_task, "camera", 6144, NULL, USB_PRIORITY - 1, NULL, 0);
+
+    /* USB Host先获得启动时间，避免摄像头与Wi-Fi同时产生电流尖峰。 */
+    vTaskDelay(pdMS_TO_TICKS(WIFI_STARTUP_DELAY_MS));
+    //wifi_start_ap();
+    //start_web_server();
 }
